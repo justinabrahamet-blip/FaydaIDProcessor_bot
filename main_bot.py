@@ -13,9 +13,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 
 # CONFIGURATION 
-ADMIN_ID = 971543891  
-TELEBIRR_NUMBER = "+251912661298"
-BOT_TOKEN = "8297764475:AAHKYCyrVfkC5Ghvwhec8aQoOmsueY8n8hg"
+ADMIN_ID = 1032772516  
+TELEBIRR_NUMBER = "0923804952"
+BOT_TOKEN = "8212668446:AAGAs1oZI0cqiJQ-tC6MKLbDuQaBXLL3Czc"
 # ADD THIS LINE:
 REMBG_SESSION = new_session()
 
@@ -87,8 +87,8 @@ def get_next_serial_number():
     filename = "serial_counter.txt"
     if not os.path.exists(filename):
         with open(filename, "w") as f:
-            f.write("7000000")
-            return "7000000"
+            f.write("0000000")
+            return "6000000"
     with open(filename, "r") as f:
         content = f.read().strip()
         current_sn = int(content) if content else 7000000
@@ -146,15 +146,31 @@ def extract_data_from_pdf(pdf_path, user_id):
     doc.close()
     return data
 
+def load_bold_font(size):
+    font_candidates = [
+        "Ebrima Bold.ttf",
+        "Ebrima.ttf",
+        "ebrimabd.ttf",
+        "ebrima.ttf",
+        "arialbd.ttf",
+        "DejaVuSans-Bold.ttf",
+    ]
+    for font_name in font_candidates:
+        try:
+            return ImageFont.truetype(font_name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
 def generate_fayda_v3(data, output_path, user_id, mode="color"):
     template_path = "Templet2.png" if os.path.exists("Templet2.png") else "Templet2.jpg"
     if not os.path.exists(template_path): return False
     canvas = Image.open(template_path).convert("RGBA")
     draw = ImageDraw.Draw(canvas)
-    try:
-        f_amh, f_bold, f_small = ImageFont.truetype("nyala.ttf", 39), ImageFont.truetype("arialbd.ttf", 32), ImageFont.truetype("arialbd.ttf", 23)
-    except:
-        f_amh = f_bold = f_small = ImageFont.load_default()
+    f_amh = load_bold_font(39)
+    f_bold = load_bold_font(32)
+    f_small = load_bold_font(23)
 
     # Dynamic Rotated Dates
     now = datetime.now()
@@ -294,18 +310,24 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
     data = query.data.split("_")
     if data[0] == "appr":
         add_credits(int(data[1]), int(data[2]))
         await context.bot.send_message(chat_id=int(data[1]), text="✅ Payment Approved!")
-    await query.edit_message_text("Done.")
+        await query.edit_message_text("✅ Approved")
+    elif data[0] == "rej":
+        await context.bot.send_message(chat_id=int(data[1]), text="❌ Payment Rejected")
+        await query.edit_message_text("❌ Rejected")
+    else:
+        await query.edit_message_text("Done.")
 
 
 # 5. INTEGRATED PDF HANDLER
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if get_credits(user_id) < 1:
+    if get_credits(user_id) < 0:
         await update.message.reply_text("❌ Insufficient balance.", reply_markup=main_menu_keyboard())
         return
 
@@ -350,8 +372,11 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 conv = ConversationHandler(
     entry_points=[CommandHandler('start', start)],
     states={
-        MENU: [CallbackQueryHandler(button_tap), MessageHandler(filters.Document.PDF, handle_pdf)],
-        BUY_PACK: [CallbackQueryHandler(select_package)],
+        MENU: [
+            CallbackQueryHandler(button_tap, pattern="^(buy_package|print_id|contact_help)$"),
+            MessageHandler(filters.Document.PDF, handle_pdf)
+        ],
+        BUY_PACK: [CallbackQueryHandler(select_package, pattern="^(pkg_1|pkg_20|pkg_100|pkg_150)$")],
         WAIT_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)]
     },
     fallbacks=[CommandHandler('start', start)]
