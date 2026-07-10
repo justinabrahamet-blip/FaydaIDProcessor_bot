@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+users.db
+serial_counter.txt
+.env
+.DS_Store

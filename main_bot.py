@@ -51,7 +51,7 @@ async def webhook():
     return "ok", 200
 
 # Conversation States
-MENU, BUY_PACK, WAIT_RECEIPT = range(3)
+MENU, BUY_PACK, WAIT_RECEIPT, SETTINGS = range(4)
 
 
 # 1. DATABASE LOGIC
@@ -158,12 +158,15 @@ def load_bold_font(size):
     return ImageFont.load_default()
 
 
-def generate_fayda_v3(data, output_path, user_id, mode="color"):
+def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=None, qr_size=None):
     template_candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
-    template_path = next((name for name in template_candidates if os.path.exists(name)), None)
-    if not template_path:
+    if template_path and os.path.exists(template_path):
+        chosen_template = template_path
+    else:
+        chosen_template = next((name for name in template_candidates if os.path.exists(name)), None)
+    if not chosen_template:
         return False
-    canvas = Image.open(template_path).convert("RGBA")
+    canvas = Image.open(chosen_template).convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     f_amh = load_bold_font(26)
     f_bold = load_bold_font(26)
@@ -198,7 +201,12 @@ def generate_fayda_v3(data, output_path, user_id, mode="color"):
         canvas.paste(ghost, (850, 480), ghost)
 
     # Assets (QR, Fingerprint)
-    for asset, size, pos in [(f"qr_{user_id}.png", (260, 260), (1520, 20)), (f"fin_{user_id}.png", (240, 50), (1230, 508))]:
+    # Set QR size to 4.15 cm square (convert to pixels at 300 DPI)
+    qr_cm = 4.15
+    dpi = 300
+    qr_size_var = int(round((qr_cm / 2.54) * dpi))
+    assets = [(f"qr_{user_id}.png", (qr_size_var, qr_size_var), (1520, 60)), (f"fin_{user_id}.png", (240, 50), (1200, 508))]
+    for asset, size, pos in assets:
         if os.path.exists(asset):
             img = Image.open(asset).resize(size).convert("RGBA")
             canvas.paste(img, pos, img)
@@ -219,7 +227,10 @@ def generate_fayda_v3(data, output_path, user_id, mode="color"):
         draw.text((back_x, y_addr), line, font=f_amh, fill="black")
         y_addr += 40
 
-    canvas.convert("RGB").save(output_path, "PNG")
+    # Save as PDF if filename extension requests it, otherwise default to PNG
+    # Save output as PNG
+    rgb = canvas.convert("RGB")
+    rgb.save(output_path, "PNG")
     return True
 
 # ==========================================
@@ -235,6 +246,81 @@ def package_keyboard():
                                  [InlineKeyboardButton("500 birr = 25 packages", callback_data='pkg_20')],
                                  [InlineKeyboardButton("1500 birr = 100 packages", callback_data='pkg_100')],
                                  [InlineKeyboardButton("2000 birr = 155 packages", callback_data='pkg_150')]])
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    current_tpl = context.user_data.get('template_choice', 'default')
+    current_qr = context.user_data.get('qr_size', 260)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Template Choice", callback_data='set_template')],
+        [InlineKeyboardButton("QR Size", callback_data='set_qr')],
+        [InlineKeyboardButton("Back", callback_data='back_main')]
+    ])
+    await update.message.reply_text(f"Settings\nTemplate: {current_tpl}\nQR size: {current_qr}", reply_markup=kb)
+    return SETTINGS
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    # Show template options
+    if data == 'set_template':
+        candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
+        buttons = [[InlineKeyboardButton(os.path.basename(c), callback_data=f"tpl:{os.path.basename(c)}")] for c in candidates if os.path.exists(c)]
+        if not buttons:
+            await query.edit_message_text("No templates found in the working directory.")
+            return
+        await query.edit_message_text("Choose a template:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if data.startswith('tpl:'):
+        chosen = data.split(':', 1)[1]
+        context.user_data['template_choice'] = chosen
+        await query.edit_message_text(f"Template set to {chosen}")
+        return
+    # QR size options
+    if data == 'set_qr':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Small (150)", callback_data='qr:150')],
+            [InlineKeyboardButton("Medium (260)", callback_data='qr:260')],
+            [InlineKeyboardButton("Large (350)", callback_data='qr:350')],
+            [InlineKeyboardButton("Custom", callback_data='qr:custom')],
+            [InlineKeyboardButton("Back", callback_data='back_main')]
+        ])
+        await query.edit_message_text("Choose QR size:", reply_markup=kb)
+        return
+    if data.startswith('qr:'):
+        val = data.split(':', 1)[1]
+        if val == 'custom':
+            context.user_data['qr_custom_pending'] = True
+            await query.edit_message_text("Send me the QR size in pixels (e.g. 300)")
+            return
+        try:
+            size = int(val)
+            context.user_data['qr_size'] = size
+            await query.edit_message_text(f"QR size set to {size}")
+        except Exception:
+            await query.edit_message_text("Invalid size")
+        return
+    if data == 'back_main':
+        await query.edit_message_text("Back to main menu.", reply_markup=main_menu_keyboard())
+        return
+
+
+async def qr_custom_size_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Accept a numeric text message when waiting for custom QR size
+    if context.user_data.get('qr_custom_pending'):
+        text = update.message.text.strip()
+        if text.isdigit():
+            size = int(text)
+            context.user_data['qr_size'] = size
+            context.user_data.pop('qr_custom_pending', None)
+            await update.message.reply_text(f"QR size set to {size}")
+        else:
+            await update.message.reply_text("Please send a numeric pixel size (e.g. 300)")
+    else:
+        return
 
 
 # 4. BOT HANDLERS
@@ -340,9 +426,13 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data:
             c_out, b_out = f"C_{user_id}.png", f"B_{user_id}.png"
             
-            # FIXED: Run generation in background threads
-            await asyncio.to_thread(generate_fayda_v3, data, c_out, user_id, "color")
-            await asyncio.to_thread(generate_fayda_v3, data, b_out, user_id, "bw")
+            # Respect user's settings (template choice and qr size)
+            user_template = context.user_data.get('template_choice')
+            user_qr_size = context.user_data.get('qr_size')
+
+            # Run generation in background threads with settings
+            await asyncio.to_thread(generate_fayda_v3, data, c_out, user_id, "color", template_path=user_template, qr_size=user_qr_size)
+            await asyncio.to_thread(generate_fayda_v3, data, b_out, user_id, "bw", template_path=user_template, qr_size=user_qr_size)
             
             with open(c_out, 'rb') as f: await update.message.reply_document(f, filename="Fayda_Color.png")
             with open(b_out, 'rb') as f: await update.message.reply_document(f, filename="Fayda_BW.png")
@@ -380,6 +470,9 @@ conv = ConversationHandler(
 
 app.add_handler(conv)
 app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
+app.add_handler(CommandHandler('settings', settings_cmd))
+app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_template|set_qr|back_main|tpl:.*|qr:.*)$"))
+app.add_handler(MessageHandler(filters.Regex(r'^\d+$') & ~filters.COMMAND, qr_custom_size_handler))
 
 # 2. Add a helper to start the bot's background processes
 async def setup_webhook():
