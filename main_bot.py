@@ -186,7 +186,7 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
         canvas.paste(rotated, position, rotated)
 
     draw_rotated_text(g_date, (22, 7), f_small)
-    draw_rotated_text(e_date, (22, 270), f_small)
+    draw_rotated_text(e_date, (22, 260), f_small)
 
     # Photo Logic
     photo_path = f"photo_{user_id}.png"
@@ -205,7 +205,7 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
     qr_cm = 4.15
     dpi = 300
     qr_size_var = int(round((qr_cm / 2.54) * dpi))
-    assets = [(f"qr_{user_id}.png", (qr_size_var, qr_size_var), (1520, 60)), (f"fin_{user_id}.png", (240, 50), (1200, 508))]
+    assets = [(f"qr_{user_id}.png", (qr_size_var, qr_size_var), (1520, 60)), (f"fin_{user_id}.png", (240, 50), (1170, 508))]
     for asset, size, pos in assets:
         if os.path.exists(asset):
             img = Image.open(asset).resize(size).convert("RGBA")
@@ -218,7 +218,7 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
     draw.text((text_x, 304), data['dob'], font=f_bold, fill="black")
     draw.text((text_x, 370), data['sex'], font=f_amh, fill="black")
     draw.text((text_x, 440), data['expiry'], font=f_bold, fill="black")
-    draw.text((460, 490), data['fan'], font=f_bold, fill="black")
+    draw.text((470, 490), data['fan'], font=f_bold, fill="black")
     draw.text((canvas.width - 180, canvas.height - 56), data['sn'], font=f_bold, fill="black")
 
     back_x, y_addr = (canvas.width // 2) + 26, 234
