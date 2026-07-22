@@ -315,7 +315,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             "Send your CBE receipt text or mbreciept.cbe.com.et link.\n"
             "Example: https://mbreciept.cbe.com.et/v2-hfFiuioHOUGiogiuyOIh",
-            reply_markup=back_keyboard(),
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -344,7 +344,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"PDF to ID costs {int(price) if price.is_integer() else price} ETB. "
             f"Your balance: {int(balance) if balance.is_integer() else balance} ETB.\n"
             "Send your PDF document now.",
-            reply_markup=back_keyboard(),
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -357,7 +357,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"FAN to ID costs {int(price) if price.is_integer() else price} ETB. "
             f"Your balance: {int(balance) if balance.is_integer() else balance} ETB.\n"
             "Send your FAN or FIN number now.",
-            reply_markup=back_keyboard(),
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -458,13 +458,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "admin_set_pdf_price" and user_id == ADMIN_ID:
         context.user_data.clear()
         context.user_data["price_update"] = "pdf_to_id_price"
-        await query.edit_message_text("Send the new PDF to ID price in ETB.", reply_markup=back_keyboard())
+        await query.edit_message_text("Send the new PDF to ID price in ETB.", reply_markup=admin_menu_keyboard())
         return
 
     if data == "admin_set_fan_price" and user_id == ADMIN_ID:
         context.user_data.clear()
         context.user_data["price_update"] = "fan_to_id_price"
-        await query.edit_message_text("Send the new FAN to ID price in ETB.", reply_markup=back_keyboard())
+        await query.edit_message_text("Send the new FAN to ID price in ETB.", reply_markup=admin_menu_keyboard())
         return
 
     if data == "back":
