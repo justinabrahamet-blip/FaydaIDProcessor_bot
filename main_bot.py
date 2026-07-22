@@ -843,7 +843,11 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("You are not authorized to use admin controls.")
         return
     await update.message.reply_text("Admin dashboard.", reply_markup=admin_menu_keyboard())
-
+async def reply_keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Use the reply keyboard below:",
+        reply_markup=reply_keyboard_layout(),
+    )
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
