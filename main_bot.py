@@ -251,17 +251,17 @@ def format_success_message(amount: float, date_text: str, balance: float) -> str
     )
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def reply_keyboard_layout() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         [
-            [InlineKeyboardButton("📄 PDF to ID", callback_data="pdf_to_id")],
-            [InlineKeyboardButton("🔑 FAN to ID", callback_data="fan_to_id")],
-            [InlineKeyboardButton("💳 Deposit", callback_data="deposit")],
-            [InlineKeyboardButton("💰 Balance", callback_data="balance")],
-            [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
-        ]
+            [KeyboardButton("🖨️ PDF to ID"), KeyboardButton("💳 Deposit")],
+            [KeyboardButton("🔑 FAN/FIN to ID"), KeyboardButton("⚙️ Settings")],
+            [KeyboardButton("📞 Help"), KeyboardButton("🏠 Start")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
     )
-
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
