@@ -7,7 +7,7 @@ from datetime import datetime
 
 import requests
 from flask import Flask, request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -278,6 +278,25 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
 def back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Back", callback_data="back")]]
+    )
+
+
+def reply_keyboard_layout() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
+            [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        selective=False,
+    )
+
+
+async def reply_keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Use the reply keyboard below:",
+        reply_markup=reply_keyboard_layout(),
     )
 
 
@@ -799,8 +818,9 @@ def create_bot_application() -> object:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("replykeys", reply_keys))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.DOCUMENT.PDF, handle_pdf_document))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
