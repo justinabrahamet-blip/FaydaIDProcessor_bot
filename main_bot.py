@@ -5,22 +5,23 @@ from flask import Flask, request  # Add this
 import re
 import io
 import asyncio
+import random
+import requests
 from datetime import datetime
 from rembg import remove, new_session
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageChops
 import numpy as np
 from ethiopian_date import EthiopianDateConverter
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 
 # CONFIGURATION 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 TELEBIRR_NUMBER = os.environ.get("TELEBIRR_NUMBER", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required")
-# ADD THIS LINE:
-REMBG_SESSION = new_session()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7662166641:AAHn8IZ3nHFPhU2YtJZlMMIJVW8vUaGu7E8")
+FAYDA_API_BASE = os.environ.get("FAYDA_API_BASE", "https://fayda-railway-full-production.up.railway.app")
+FAYDA_API_KEY = os.environ.get("FAYDA_API_KEY", "rk_85c7922a2271c518c2302350fb2a2777898c6c82ec6a0786")
+REMBG_SESSION = new_session(model_name='u2net')
 
 # flask
 # --- ADD THIS BLOCK ---
@@ -87,20 +88,9 @@ def add_credits(user_id, amount):
 # 2. PDF & ID LOGIC (Preserving your exact extraction)
 
 def get_next_serial_number():
-    filename = "serial_counter.txt"
-    if not os.path.exists(filename):
-        with open(filename, "w") as f:
-            f.write("0000000")
-            return "6000000"
-    with open(filename, "r") as f:
-        content = f.read().strip()
-        current_sn = int(content) if content else 7000000
-    next_sn = current_sn + 1
-    with open(filename, "w") as f:
-        f.write(str(next_sn))
-    return str(next_sn)
+    return f"{random.randint(10_000_00, 99_999_99)}"
 
-def extract_data_from_pdf(pdf_path, user_id):
+def extract_data_from_pdf(pdf_path, user_id, keep_background=False):
     if not os.path.exists(pdf_path): return None
     doc = fitz.open(pdf_path)
     page = doc[0]
@@ -116,9 +106,20 @@ def extract_data_from_pdf(pdf_path, user_id):
         
         if i == 0:
             img_data = pix.tobytes("png")
-            output_image = remove(Image.open(io.BytesIO(img_data)), session=REMBG_SESSION)
-            output_image.save(paths['photo'])
-        elif i == 1: pix.save(paths['qr'])
+            raw_image = Image.open(io.BytesIO(img_data)).convert("RGBA")
+            if keep_background:
+                raw_image = feather_upper_half(raw_image)
+                raw_image.save(paths['photo'])
+            else:
+                output_image = remove(
+                    raw_image,
+                    session=REMBG_SESSION,
+                    alpha_matting=False,
+                    post_process_mask=True,
+                )
+                output_image.save(paths['photo'])
+        elif i == 1:
+            pix.save(paths['qr'])
 
     page.get_pixmap(clip=fitz.Rect(496.5, 493, 540, 501), matrix=fitz.Matrix(4, 4)).save(paths['fin'])
     
@@ -186,7 +187,25 @@ def bilateral_alpha_blur(alpha, diameter=15, sigma_color=75, sigma_space=75):
     return Image.fromarray(filtered, mode='L')
 
 
-def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=None, qr_size=None):
+def feather_upper_half(image, feather_strength=150):
+    image = image.convert("RGBA")
+    width, height = image.size
+    _, _, _, alpha = image.split()
+    gradient = Image.new("L", (1, height), color=255)
+    for y in range(height):
+        if y < height // 2:
+            fade = 1.0 - ((height // 2 - y) / float(height // 2))
+            alpha_value = int(255 - (feather_strength * (1.0 - fade)))
+            gradient.putpixel((0, y), max(0, min(255, alpha_value)))
+        else:
+            gradient.putpixel((0, y), 255)
+    gradient = gradient.resize((width, height))
+    alpha = ImageChops.multiply(alpha, gradient)
+    image.putalpha(alpha)
+    return image
+
+
+def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=None, qr_size=None, flip=True):
     template_candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
     if template_path and os.path.exists(template_path):
         chosen_template = template_path
@@ -265,11 +284,11 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
         draw.text((back_x, y_addr), line, font=f_amh, fill="black")
         y_addr += 40
 
-    # Flip the final composed output for all generated images
-    canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
+    # Flip the final composed output when requested
+    if flip:
+        canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
 
-    # Save as PDF if filename extension requests it, otherwise default to PNG
-    # Save output as PNG
+    # Save as PNG
     rgb = canvas.convert("RGB")
     rgb.save(output_path, "PNG")
     return True
@@ -278,27 +297,61 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
 # 3. UI HELPERS
 # ==========================================
 def main_menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🖨 Print ID", callback_data='print_id')],
-                                 [InlineKeyboardButton("💳 Buy Package", callback_data='buy_package')],
-                                 [InlineKeyboardButton("📞 Contact Help", callback_data='contact_help')]])
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🖨️ Print ID")],
+        [KeyboardButton("💳 Buy Pack")],
+        [KeyboardButton("🔑 FAN/FIN")],
+        [KeyboardButton("📞 Help")],
+        [KeyboardButton("🏠 Start")]
+    ], resize_keyboard=True, one_time_keyboard=False, selective=False)
 
 def package_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("40 birr = 1 package", callback_data='pkg_1')],
-                                 [InlineKeyboardButton("500 birr = 25 packages", callback_data='pkg_20')],
-                                 [InlineKeyboardButton("1500 birr = 100 packages", callback_data='pkg_100')],
-                                 [InlineKeyboardButton("2000 birr = 155 packages", callback_data='pkg_150')]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("40 birr = 1", callback_data='pkg_1')],
+        [InlineKeyboardButton("500 birr = 25", callback_data='pkg_20')],
+        [InlineKeyboardButton("1500 birr = 100", callback_data='pkg_100')],
+        [InlineKeyboardButton("2000 birr = 155", callback_data='pkg_150')],
+        [InlineKeyboardButton("Cancel", callback_data='cancel')]
+    ])
+
+def navigation_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')]
+    ])
+
+def get_available_templates():
+    candidates = [
+        "fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png",
+        "Templet2.png", "Templet2.jpg"
+    ]
+    return [path for path in candidates if os.path.exists(path)]
+
+
+def template_label(template_choice):
+    if not template_choice:
+        return "Default"
+    templates = get_available_templates()
+    if template_choice in templates:
+        return f"Template {templates.index(template_choice) + 1}"
+    return os.path.basename(template_choice)
 
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    current_tpl = context.user_data.get('template_choice', 'default')
+    current_tpl = template_label(context.user_data.get('template_choice'))
     current_mode = context.user_data.get('output_mode', 'color')
+    current_orientation = context.user_data.get('orientation', 'flip')
+    current_bg = context.user_data.get('background_mode', 'remove')
+    current_auto = context.user_data.get('auto_destroy', 'on')
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Template Choice", callback_data='set_template')],
-        [InlineKeyboardButton("Output Mode", callback_data='set_mode')],
-        [InlineKeyboardButton("Back", callback_data='back_main')]
+        [InlineKeyboardButton("Template", callback_data='set_template'), InlineKeyboardButton("BG", callback_data='set_bg')],
+        [InlineKeyboardButton("Orientation", callback_data='set_orientation'), InlineKeyboardButton("Auto Destroy", callback_data='set_auto_destroy')],
+        [InlineKeyboardButton("Mode", callback_data='set_mode'), InlineKeyboardButton("Back", callback_data='back_main')]
     ])
-    await update.message.reply_text(f"Settings\nTemplate: {current_tpl}\nOutput Mode: {current_mode}", reply_markup=kb)
+    await update.message.reply_text(
+        f"Settings\nTemplate: {current_tpl}\nOrientation: {current_orientation}\nBG: {current_bg}\nAuto Destroy: {current_auto}\nMode: {current_mode}",
+        reply_markup=kb
+    )
     return SETTINGS
 
 
@@ -306,39 +359,104 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    # Show template options
+
     if data == 'set_template':
-        candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
-        buttons = [[InlineKeyboardButton(os.path.basename(c), callback_data=f"tpl:{os.path.basename(c)}")] for c in candidates if os.path.exists(c)]
+        templates = get_available_templates()
+        buttons = [[InlineKeyboardButton(f"Template {i + 1}", callback_data=f"tpl:{tmpl}")] for i, tmpl in enumerate(templates)]
         if not buttons:
             await query.edit_message_text("No templates found in the working directory.")
             return
+        buttons.append([InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')])
         await query.edit_message_text("Choose a template:", reply_markup=InlineKeyboardMarkup(buttons))
         return
+
     if data.startswith('tpl:'):
         chosen = data.split(':', 1)[1]
         context.user_data['template_choice'] = chosen
-        await query.edit_message_text(f"Template set to {chosen}")
+        await query.edit_message_text(f"Template set to {template_label(chosen)}", reply_markup=navigation_keyboard())
         return
-    # Output mode options
+
+    if data == 'set_orientation':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Normal", callback_data='orient:normal')],
+            [InlineKeyboardButton("Flipped", callback_data='orient:flip')],
+            [InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')]
+        ])
+        await query.edit_message_text("Choose orientation:", reply_markup=kb)
+        return
+
+    if data.startswith('orient:'):
+        val = data.split(':', 1)[1]
+        if val in ['normal', 'flip']:
+            context.user_data['orientation'] = val
+            await query.edit_message_text(f"Orientation set to {val}", reply_markup=navigation_keyboard())
+        else:
+            await query.edit_message_text("Invalid orientation", reply_markup=navigation_keyboard())
+        return
+
+    if data == 'set_bg':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Keep", callback_data='bg:keep')],
+            [InlineKeyboardButton("Remove", callback_data='bg:remove')],
+            [InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')]
+        ])
+        await query.edit_message_text("Photo background:", reply_markup=kb)
+        return
+
+    if data.startswith('bg:'):
+        val = data.split(':', 1)[1]
+        if val in ['keep', 'remove']:
+            context.user_data['background_mode'] = val
+            await query.edit_message_text(f"Background mode set to {val}", reply_markup=navigation_keyboard())
+        else:
+            await query.edit_message_text("Invalid background mode", reply_markup=navigation_keyboard())
+        return
+
+    if data == 'set_auto_destroy':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("On", callback_data='auto_destroy:on')],
+            [InlineKeyboardButton("Off", callback_data='auto_destroy:off')],
+            [InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')]
+        ])
+        await query.edit_message_text("Auto destroy:", reply_markup=kb)
+        return
+
+    if data.startswith('auto_destroy:'):
+        val = data.split(':', 1)[1]
+        if val in ['on', 'off']:
+            context.user_data['auto_destroy'] = val
+            await query.edit_message_text(f"Auto destroy set to {val}", reply_markup=navigation_keyboard())
+        else:
+            await query.edit_message_text("Invalid auto destroy value", reply_markup=navigation_keyboard())
+        return
+
     if data == 'set_mode':
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Color", callback_data='mode:color')],
             [InlineKeyboardButton("B/W", callback_data='mode:bw')],
-            [InlineKeyboardButton("Back", callback_data='back_main')]
+            [InlineKeyboardButton("Back", callback_data='back_main'), InlineKeyboardButton("Cancel", callback_data='cancel')]
         ])
         await query.edit_message_text("Choose output mode:", reply_markup=kb)
         return
+
     if data.startswith('mode:'):
         val = data.split(':', 1)[1]
         if val in ['color', 'bw']:
             context.user_data['output_mode'] = val
-            await query.edit_message_text(f"Output mode set to {val}")
+            await query.edit_message_text(f"Output mode set to {val}", reply_markup=navigation_keyboard())
         else:
-            await query.edit_message_text("Invalid mode")
+            await query.edit_message_text("Invalid mode", reply_markup=navigation_keyboard())
         return
+
     if data == 'back_main':
         await query.edit_message_text("Back to main menu.", reply_markup=main_menu_keyboard())
+        return
+
+    if data == 'cancel':
+        context.user_data.pop('fan_flow', None)
+        context.user_data.pop('otp_flow', None)
+        context.user_data.pop('pending_receipt', None)
+        await query.edit_message_text("Cancelled. Back to menu.", reply_markup=main_menu_keyboard())
         return
 
 
@@ -348,34 +466,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     credits = get_credits(user_id)
     welcome = (
-        "Welcome to the National ID Fayda Printable Converter Service! 🎉\n\n"
-        "📑 **To get your printable ID card:**\n"
-        "1. Download the FAYDA ID pdf from FAYDA app  OR Telebirr \n"
-        "2. Send the downloaded PDF file here to this bot.\n\n"
-        "እንኳን ወደ ብሔራዊ መታወቂያ ፋይዳ ካርድ ሊታተም የሚችል መቀየሪያ አገልግሎት በደህና መጡ! 🎉\n"
-        "🪪 ሊታተም የሚችል መታወቂያ ካርድዎን ለማግኘት፡-\n"
-       "1. የFAYDA መታወቂያ ፒዲኤፍ ከFAYDA መተግበሪያ ወይም ከTelebirr ያውርዱ \n"
-       "2. የወረደውን የፒዲኤፍ ፋይል ወደዚህ ቦት ይላኩ።\n\n"
-       "Baga Gara Tajaajila Jijjiirraa Maxxanfamuu Danda'u FAYDA Eenyummaa Biyyaalessaatti dhuftan! 🎉\n\n" 
-"📑 NATIONAL ID  maxxanfamuu danda'u argachuuf:**\n" 
-"1. ID FAYDA pdf appii FAYDA YKN Telebirr irraa buufadhaa \n" 
-"2. Faayila PDF buufame as gara bot kanaatti ergi.\n\n"
-        f"💰 **Your Balance:** {credits} packages"
+        "Welcome to Fayda ID Converter! 🎉\n"
+        "Send your FAYDA PDF or use 🔑 FAN/FIN.\n"
+        "Tap a button below to begin.\n\n"
+        f"💰 Balance: {credits} packages"
     )
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    await update.message.reply_text(welcome, reply_markup=main_menu_keyboard())
     return MENU
 
 async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == 'buy_package':
-        await query.edit_message_text("Select a package below 👇", reply_markup=package_keyboard())
+        context.user_data.pop('fan_flow', None)
+        context.user_data['pending_receipt'] = True
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Select a package below 👇", reply_markup=package_keyboard())
         return BUY_PACK
     elif query.data == 'print_id':
-        await query.message.reply_text("Please send your Fayda PDF file now.")
+        context.user_data.pop('fan_flow', None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Send your FAYDA PDF.", reply_markup=main_menu_keyboard())
         return MENU
+    elif query.data == 'fan_flow':
+        context.user_data['fan_flow'] = True
+        context.user_data.pop('pending_receipt', None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Send FAN or FIN (12-16 digits).", reply_markup=main_menu_keyboard())
+        return MENU
+    elif query.data == 'settings':
+        current_tpl = template_label(context.user_data.get('template_choice'))
+        current_mode = context.user_data.get('output_mode', 'color')
+        current_orientation = context.user_data.get('orientation', 'flip')
+        current_bg = context.user_data.get('background_mode', 'remove')
+        current_auto = context.user_data.get('auto_destroy', 'on')
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Template", callback_data='set_template'), InlineKeyboardButton("BG", callback_data='set_bg')],
+            [InlineKeyboardButton("Orientation", callback_data='set_orientation'), InlineKeyboardButton("Auto Destroy", callback_data='set_auto_destroy')],
+            [InlineKeyboardButton("Mode", callback_data='set_mode'), InlineKeyboardButton("Back", callback_data='back_main')]
+        ])
+        await query.edit_message_text(
+            f"Settings\nTemplate: {current_tpl}\nOrientation: {current_orientation}\nBG: {current_bg}\nAuto Destroy: {current_auto}\nMode: {current_mode}",
+            reply_markup=kb
+        )
+        return SETTINGS
     elif query.data == 'contact_help':
-        await query.message.reply_text("Support: @altleg")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Get support on @globalformfiller", reply_markup=main_menu_keyboard())
+        return MENU
+    elif query.data == 'cancel':
+        context.user_data.pop('fan_flow', None)
+        context.user_data.pop('otp_flow', None)
+        context.user_data.pop('pending_receipt', None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Cancelled. Back to menu.", reply_markup=main_menu_keyboard())
+        return MENU
+    elif query.data == 'delete_output':
+        await query.answer("Output buttons cleared")
+        await query.edit_message_reply_markup(reply_markup=None)
         return MENU
 
 async def select_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,16 +531,41 @@ async def select_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     pkg_map = {'pkg_1': '1', 'pkg_20': '20', 'pkg_100': '100', 'pkg_150': '150'}
     context.user_data['pending_pkg'] = pkg_map[query.data]
-    await query.edit_message_text(f"Pay to **{TELEBIRR_NUMBER}** then send the SMS receipt here.")
+    context.user_data['pending_receipt'] = True
+    await query.edit_message_text(f"Pay to **{TELEBIRR_NUMBER}** and send the receipt.")
     return WAIT_RECEIPT
 
+async def handle_main_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "🖨️ Print ID":
+        context.user_data.pop('fan_flow', None)
+        await update.message.reply_text("Send your FAYDA PDF.", reply_markup=main_menu_keyboard())
+        return MENU
+    elif text == "💳 Buy Pack":
+        context.user_data.pop('fan_flow', None)
+        context.user_data['pending_receipt'] = True
+        await update.message.reply_text("Select a package below 👇", reply_markup=package_keyboard())
+        return BUY_PACK
+    elif text == "🔑 FAN/FIN":
+        context.user_data['fan_flow'] = True
+        context.user_data.pop('pending_receipt', None)
+        await update.message.reply_text("Send FAN or FIN (12-16 digits).", reply_markup=main_menu_keyboard())
+        return MENU
+    elif text == "📞 Help":
+        await update.message.reply_text("Get support on @globalformfiller", reply_markup=main_menu_keyboard())
+        return MENU
+    elif text == "🏠 Start":
+        return await start(update, context)
+    return
+
 async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('pending_receipt'):
+        await update.message.reply_text("Select a package first, then send the receipt.")
+        return MENU
+
     user = update.message.from_user
     
-    # Get the username or fallback to First Name if they don't have one
     user_name = f"@{user.username}" if user.username else user.first_name
-    
-    # Add Username to the admin message
     admin_msg = (
         f"🔔 New Payment\n"
         f"👤 User: {user_name}\n"
@@ -406,8 +579,9 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}")
     ]])
     
-    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, reply_markup=btns, parse_mode="Markdown")
-    await update.message.reply_text("Receipt sent for approval. / ደረሰኝዎ ለቁጥጥር ተልኳል።")
+    context.user_data.pop('pending_receipt', None)
+    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, reply_markup=btns)
+    await update.message.reply_text("Receipt sent for approval.")
     return MENU
 
 async def admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,14 +598,129 @@ async def admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text("Done.")
 
+def create_fayda_session(fan: str):
+    headers = {"x-api-key": FAYDA_API_KEY}
+    payload = {"individualId": fan}
+    return requests.post(
+        f"{FAYDA_API_BASE}/api/session",
+        json=payload,
+        headers=headers,
+        timeout=20,
+    )
+
+def verify_fayda_session(session_id: str, otp: str):
+    headers = {"x-api-key": FAYDA_API_KEY}
+    payload = {"otp": otp, "format": "pdf"}
+    return requests.post(
+        f"{FAYDA_API_BASE}/api/session/{session_id}/verify",
+        json=payload,
+        headers=headers,
+        timeout=20,
+    )
+
+async def handle_fan_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('fan_flow'):
+        return
+
+    fan = update.message.text.strip()
+    if not re.fullmatch(r"\d{12,16}", fan):
+        await update.message.reply_text("Send a valid FAN or FIN number (12-16 digits).")
+        return
+
+    await update.message.reply_text("⏳ Requesting OTP for your FAN/FIN...")
+    try:
+        response = await asyncio.to_thread(create_fayda_session, fan)
+    except requests.exceptions.RequestException as exc:
+        await update.message.reply_text("⚠️ Could not contact Fayda API. Please try again later.")
+        print(f"Fayda session request failed: {exc}")
+        return
+
+    if response.status_code != 200:
+        error_text = response.text or response.reason
+        await update.message.reply_text(f"⚠️ Failed to start session: {error_text}")
+        return
+
+    try:
+        data = response.json()
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid response from Fayda API. Please try again.")
+        print(f"Invalid JSON from Fayda session response: {response.text}")
+        return
+
+    session_id = data.get("sessionId") or data.get("session_id") or data.get("id")
+    masked = data.get("maskedMobile") or data.get("masked_mobile") or data.get("maskedPhone")
+    if not session_id:
+        await update.message.reply_text("⚠️ Could not start session. Please try again.")
+        print(f"Missing sessionId in Fayda response: {data}")
+        return
+
+    context.user_data['fan_flow'] = False
+    context.user_data['otp_flow'] = True
+    context.user_data['fayda_session_id'] = session_id
+    await update.message.reply_text(f"✅ OTP sent to {masked or 'your registered phone'}. Please send the OTP code now.")
+
+async def handle_otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('otp_flow'):
+        return
+
+    otp = update.message.text.strip()
+    if not re.fullmatch(r"\d{4,6}", otp):
+        await update.message.reply_text("Send the OTP (4-6 digits).")
+        return
+
+    session_id = context.user_data.get('fayda_session_id')
+    if not session_id:
+        await update.message.reply_text("Session expired. Start again with FAN/FIN.")
+        context.user_data.pop('otp_flow', None)
+        return
+
+    await update.message.reply_text("⏳ Verifying OTP and downloading PDF...")
+    try:
+        response = await asyncio.to_thread(verify_fayda_session, session_id, otp)
+    except requests.exceptions.RequestException as exc:
+        await update.message.reply_text("⚠️ Could not contact Fayda API. Please try again later.")
+        print(f"Fayda verify request failed: {exc}")
+        return
+
+    if response.status_code != 200:
+        error_text = response.text or response.reason
+        await update.message.reply_text(f"⚠️ Verification failed: {error_text}")
+        return
+
+    pdf_path = f"fayda_{update.message.from_user.id}.pdf"
+    with open(pdf_path, "wb") as f:
+        f.write(response.content)
+
+    out_path = None
+    try:
+        keep_bg = context.user_data.get('background_mode', 'remove') == 'keep'
+        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, update.message.from_user.id, keep_background=keep_bg)
+        if data:
+            user_template = context.user_data.get('template_choice')
+            user_mode = context.user_data.get('output_mode', 'color')
+            out_path = f"{user_mode}_{update.message.from_user.id}.png"
+            user_flip = context.user_data.get('orientation', 'flip') == 'flip'
+            await asyncio.to_thread(generate_fayda_v3, data, out_path, update.message.from_user.id, user_mode, template_path=user_template, flip=user_flip)
+            await update.message.reply_text("✅ Success! Your ID is ready.", reply_markup=main_menu_keyboard())
+            with open(out_path, 'rb') as f:
+                filename = "Fayda_Color.png" if user_mode == 'color' else "Fayda_BW.png"
+                doc_message = await update.message.reply_document(f, filename=filename, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Clear Buttons", callback_data='delete_output')]]))
+            if context.user_data.get('auto_destroy', 'on') == 'on':
+                asyncio.create_task(auto_delete_message(context.bot, update.message.chat_id, doc_message.message_id, delay=60))
+        else:
+            await update.message.reply_text("❌ Extraction failed.")
+    finally:
+        for fpath in [pdf_path, out_path or "", f"photo_{update.message.from_user.id}.png", f"qr_{update.message.from_user.id}.png", f"fin_{update.message.from_user.id}.png"]:
+            if fpath and os.path.exists(fpath):
+                os.remove(fpath)
+        context.user_data.pop('otp_flow', None)
+        context.user_data.pop('fayda_session_id', None)
+
 
 # 5. INTEGRATED PDF HANDLER
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if get_credits(user_id) < 0:
-        await update.message.reply_text("❌ Insufficient balance.", reply_markup=main_menu_keyboard())
-        return
 
     msg = await update.message.reply_text("⏳ Processing...")
     pdf_path = f"input_{user_id}.pdf"
@@ -439,22 +728,22 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(pdf_path)
 
     try:
-        # FIXED: Run extraction in a background thread
-        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, user_id)
+        keep_bg = context.user_data.get('background_mode', 'remove') == 'keep'
+        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, user_id, keep_background=keep_bg)
         
         if data:
-            # Respect user's settings (template choice and output mode)
             user_template = context.user_data.get('template_choice')
             user_mode = context.user_data.get('output_mode', 'color')
             out_path = f"{user_mode}_{user_id}.png"
 
-            await asyncio.to_thread(generate_fayda_v3, data, out_path, user_id, user_mode, template_path=user_template)
+            user_flip = context.user_data.get('orientation', 'flip') == 'flip'
+            await asyncio.to_thread(generate_fayda_v3, data, out_path, user_id, user_mode, template_path=user_template, flip=user_flip)
+            await msg.edit_text("✅ Success! Your ID is ready.")
             with open(out_path, 'rb') as f:
                 filename = "Fayda_Color.png" if user_mode == 'color' else "Fayda_BW.png"
-                await update.message.reply_document(f, filename=filename)
-            
-            add_credits(user_id, -1)
-            await msg.edit_text(f"✅ Success! 1 package deducted. Balance: {get_credits(user_id)}")
+                doc_message = await update.message.reply_document(f, filename=filename, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Clear Buttons", callback_data='delete_output')]]))
+            if context.user_data.get('auto_destroy', 'on') == 'on':
+                asyncio.create_task(auto_delete_message(context.bot, update.message.chat_id, doc_message.message_id, delay=60))
         else:
             await msg.edit_text("❌ Extraction failed.")
     finally:
@@ -472,43 +761,51 @@ init_db()
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # Define Handlers
-conv = ConversationHandler(
-    entry_points=[CommandHandler('start', start), MessageHandler(filters.Document.PDF, handle_pdf)],
-    states={
-        MENU: [
-            MessageHandler(filters.Document.PDF, handle_pdf)
-        ],
-        BUY_PACK: [CallbackQueryHandler(select_package, pattern="^(pkg_1|pkg_20|pkg_100|pkg_150)$")],
-        WAIT_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)]
-    },
-    fallbacks=[CommandHandler('start', start)]
-)
-
-app.add_handler(conv)
+app.add_handler(CommandHandler('start', start))
+app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+app.add_handler(CallbackQueryHandler(button_tap, pattern='^(buy_package|print_id|contact_help|fan_flow|settings|cancel|delete_output)$'))
+app.add_handler(CallbackQueryHandler(select_package, pattern="^(pkg_1|pkg_20|pkg_100|pkg_150)$"))
 app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
 app.add_handler(CommandHandler('settings', settings_cmd))
-app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_template|set_mode|back_main|tpl:.*|mode:.*)$"))
+app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_template|set_orientation|set_bg|set_auto_destroy|set_mode|back_main|cancel|tpl:.*|orient:.*|bg:.*|auto_destroy:.*|mode:.*)$"))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^(🖨️ Print ID|💳 Buy Pack|🔑 FAN/FIN|📞 Help|🏠 Start)$'), handle_main_keyboard))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^[0-9]{12,16}$'), handle_fan_input))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^[0-9]{4,6}$'), handle_otp_input))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt))
 
 # 2. Add a helper to start the bot's background processes
+async def initialize_bot():
+    await app.initialize()
+    await app.start()
+
+async def auto_delete_message(bot, chat_id, message_id, delay=60):
+    await asyncio.sleep(delay)
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+    except Exception:
+        pass
+
 async def setup_webhook():
     URL = os.environ.get("RENDER_EXTERNAL_URL")
     if URL:
+        await initialize_bot()
         await app.bot.set_webhook(url=f"{URL}/webhook")
         print(f"🚀 Webhook set to {URL}/webhook")
 
 # This logic runs when Gunicorn starts
-import threading
+import asyncio
+
 if os.environ.get("RENDER_EXTERNAL_URL"):
-    # Run the webhook setup in the background
-    import asyncio
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(app.initialize())).start()
+    def _webhook_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_webhook())
+    import threading
+    threading.Thread(target=_webhook_thread, daemon=True).start()
 
 # 3. Keep the main block ONLY for local testing (VS Code)
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 10000))
-    URL = os.environ.get("RENDER_EXTERNAL_URL") 
-
+    URL = os.environ.get("RENDER_EXTERNAL_URL")
     if not URL:
         print("🚀 Local Mode: Polling")
         app.run_polling()
