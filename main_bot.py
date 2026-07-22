@@ -293,12 +293,11 @@ def reply_keyboard_layout() -> ReplyKeyboardMarkup:
     )
 
 
-async def reply_keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Use the reply keyboard below:",
+        "Welcome! Use the buttons below to deposit CBE receipts and manage your balance.",
         reply_markup=reply_keyboard_layout(),
     )
-
 
 def receipt_action_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -318,7 +317,7 @@ def receipt_action_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Welcome! Use the buttons below to deposit CBE receipts and manage your balance.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=reply_keyboard_layout(),
     )
 
 
