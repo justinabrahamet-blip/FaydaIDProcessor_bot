@@ -1,0 +1,17 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = https://github.com/justinabrahamet-blip/FaydaIDProcessor_bot
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[lfs]
+	repositoryformatversion = 0
+[remote "upstream"]
+	url = https://github.com/nisirtech1085-pixel/FaydaIDProcessor_bot.git
+	fetch = +refs/heads/*:refs/remotes/upstream/*
+[branch "undefined"]
+	vscode-merge-base = origin/main
+[lfs "https://github.com/justinabrahamet-blip/FaydaIDProcessor_bot.git/info/lfs"]
+	access = basic

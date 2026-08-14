@@ -1,0 +1,8 @@
+python-telegram-bot
+flask
+gunicorn
+pymupdf
+rembg[cpu]
+pillow
+ethiopian-date
+onnxruntime
