@@ -26,6 +26,35 @@ from telegram.ext import (
     ConversationHandler
 )
 
+# ==========================================
+# ⚡ INSTANT RENDER PORT BINDER (RUNS AT STARTUP IN 0.01s)
+# ==========================================
+def _launch_instant_render_port_listener():
+    def _run_http():
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK - Fayda ID Bot Live!")
+            def log_message(self, format, *args): pass
+        
+        port_num = int(os.environ.get("PORT", 8080))
+        try:
+            server = HTTPServer(("0.0.0.0", port_num), HealthCheckHandler)
+            print(f"🌐 Instant Render Port Listener bound to port {port_num}!")
+            server.serve_forever()
+        except Exception as e:
+            print(f"ℹ️ Port listener info: {e}")
+
+    t = threading.Thread(target=_run_http, daemon=True)
+    t.start()
+
+# Fire port listener instantly at module load so Render detects port in 0.01 seconds!
+_launch_instant_render_port_listener()
+
+
 # Python 3.14 compatibility patch for python-telegram-bot Application slots
 _APP_MARKERS = {}
 Application._Application__stop_running_marker = property(
@@ -1683,7 +1712,7 @@ def main():
     else:
         print("ℹ️ Supabase not configured in .env (Using Local SQLite Database for receipt tracking).")
 
-    print("🚀 Initializing Fayda ID Bot (Supabase + Local SQLite Receipt Tracking)...")
+    print("🚀 Initializing Fayda ID Bot (Instant Port Binding & Fast Rembg)...")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1744,28 +1773,6 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(approve_receipt, pattern="^(appr|rej)_"))
-
-    # Start background HTTP port listener thread for Render Free Tier Web Service
-    def start_dummy_port_listener():
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        class HealthCheckHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.send_header("Content-type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"OK - Fayda ID Bot is Running!")
-            def log_message(self, format, *args): pass
-        
-        port = int(os.environ.get("PORT", 8080))
-        try:
-            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            print(f"🌐 Render Web Service Port Listener active on port {port}")
-            server.serve_forever()
-        except Exception as e:
-            print(f"ℹ️ Port listener note: {e}")
-
-    port_thread = threading.Thread(target=start_dummy_port_listener, daemon=True)
-    port_thread.start()
 
     print("✅ Bot started successfully in 100% Polling mode! Listening for updates...")
     app.run_polling()
