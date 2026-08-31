@@ -1,1 +1,1 @@
-web: gunicorn main_bot:flask_app
+worker: python main_bot.py

@@ -1,5 +1,5 @@
 import sqlite3
-import fitz
+import pymupdf
 import os
 import re
 import io
@@ -594,7 +594,7 @@ def get_next_serial_number():
 def extract_data_from_pdf(pdf_path, temp_prefix):
     if not os.path.exists(pdf_path): return None
     try:
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         page = doc[0]
 
         paths = {
@@ -606,8 +606,8 @@ def extract_data_from_pdf(pdf_path, temp_prefix):
         image_list = page.get_images(full=True)
         for i, img in enumerate(image_list):
             xref = img[0]
-            pix = fitz.Pixmap(doc, xref)
-            if pix.n - pix.alpha > 3: pix = fitz.Pixmap(fitz.csRGB, pix)
+            pix = pymupdf.Pixmap(doc, xref)
+            if pix.n - pix.alpha > 3: pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
             
             if i == 0:
                 img_bytes = pix.tobytes("png")
@@ -619,7 +619,7 @@ def extract_data_from_pdf(pdf_path, temp_prefix):
             elif i == 1: 
                 pix.save(paths['qr'])
 
-        page.get_pixmap(clip=fitz.Rect(496.5, 493, 540, 501), matrix=fitz.Matrix(4, 4)).save(paths['fin'])
+        page.get_pixmap(clip=pymupdf.Rect(496.5, 493, 540, 501), matrix=pymupdf.Matrix(4, 4)).save(paths['fin'])
         
         text = page.get_text("text")
         lines = [line.strip() for line in text.split('\n') if line.strip()]
@@ -1744,6 +1744,28 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(approve_receipt, pattern="^(appr|rej)_"))
+
+    # Start background HTTP port listener thread for Render Free Tier Web Service
+    def start_dummy_port_listener():
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK - Fayda ID Bot is Running!")
+            def log_message(self, format, *args): pass
+        
+        port = int(os.environ.get("PORT", 8080))
+        try:
+            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+            print(f"🌐 Render Web Service Port Listener active on port {port}")
+            server.serve_forever()
+        except Exception as e:
+            print(f"ℹ️ Port listener note: {e}")
+
+    port_thread = threading.Thread(target=start_dummy_port_listener, daemon=True)
+    port_thread.start()
 
     print("✅ Bot started successfully in 100% Polling mode! Listening for updates...")
     app.run_polling()
