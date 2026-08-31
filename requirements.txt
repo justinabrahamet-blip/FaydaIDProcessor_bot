@@ -1,7 +1,6 @@
 python-telegram-bot
 pymupdf
-rembg[cpu]
 pillow
 ethiopian-date
-onnxruntime
 requests
+numpy
