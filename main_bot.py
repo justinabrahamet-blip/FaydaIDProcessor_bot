@@ -1771,7 +1771,7 @@ def main():
     app.add_handler(CallbackQueryHandler(approve_receipt, pattern="^(appr|rej)_"))
 
     print("✅ Bot started successfully in 100% Polling mode! Listening for updates...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
