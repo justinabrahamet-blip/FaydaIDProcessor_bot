@@ -1,148 +1,652 @@
 import sqlite3
 import fitz
 import os
-from flask import Flask, request  # Add this
 import re
 import io
+import shutil
 import asyncio
-from datetime import datetime
+import threading
+import requests
+import random
+import string
+import numpy as np
+from datetime import datetime, timedelta
 from rembg import remove, new_session
 from PIL import Image, ImageDraw, ImageFont
-import numpy as np
 from ethiopian_date import EthiopianDateConverter
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
 
-# CONFIGURATION 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "1032772516"))
-TELEBIRR_NUMBER = os.environ.get("TELEBIRR_NUMBER", "0946140878")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required")
-# ADD THIS LINE:
-REMBG_SESSION = new_session()
+# Python 3.14 compatibility patch for python-telegram-bot Application slots
+_APP_MARKERS = {}
+Application._Application__stop_running_marker = property(
+    lambda self: _APP_MARKERS.get((id(self), 'stop')),
+    lambda self, v: _APP_MARKERS.__setitem__((id(self), 'stop'), v)
+)
 
-# flask
-# --- ADD THIS BLOCK ---
-flask_app = Flask(__name__)
+# Automatically load .env file if present
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
-# 2. Define a placeholder for the bot app
-app = None
+# ==========================================
+# SECURE CONFIGURATION FROM ENVIRONMENT
+# ==========================================
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CBE_EXPECTED_ACCOUNT = os.environ.get("CBE_EXPECTED_ACCOUNT", "").strip()
+CBE_EXPECTED_HOLDER = os.environ.get("CBE_EXPECTED_HOLDER", "").strip()
+TELEBIRR_NUMBER = os.environ.get("TELEBIRR_NUMBER", "").strip()
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@mr_melaku").strip()
+DEFAULT_PDF_PRICE_VAL = os.environ.get("DEFAULT_PDF_PRICE", "40").strip()
 
-@flask_app.route('/')
-def health_check():
-    return "Bot is alive!", 200
+# SUPABASE INTEGRATION FOR CROSS-PROJECT RECEIPT DE-DUPLICATION
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "cbe_receipts").strip()
 
-@flask_app.route('/webhook', methods=['POST'])
-async def webhook():
-    global app
-    if app:
-        # Initialize and Start if not already running
-        if not app.updater: 
-            await app.initialize()
-            await app.start()
-            
-            # AUTO-SET WEBHOOK: This ensures Telegram knows where to send updates
-            URL = os.environ.get("RENDER_EXTERNAL_URL")
-            if URL:
-                await app.bot.set_webhook(url=f"{URL}/webhook")
-            
-        data = request.get_json(force=True)
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
-        
-    return "ok", 200
+OFFICIAL_CBE_DOMAIN = "mb.cbe.com.et"
+OFFICIAL_CBE_RECEIPT_HOST = "mbreciept.cbe.com.et"
 
-# Conversation States
-MENU, BUY_PACK, WAIT_RECEIPT, SETTINGS, BATCH_MODE = range(5)
+MAX_BATCH_PDFS = 5
+
+# Cache for verified receipts
+VERIFICATION_CACHE = {}
+CACHE_TTL_SECONDS = 600
+
+# Concurrency Locks to prevent double PDF processing lag
+ACTIVE_USER_LOCKS = set()
+LOCK_SET_GUARD = threading.Lock()
+
+# Global Rembg Session (pre-loaded for zero cold-start delay)
+REMBG_SESSION = None
+
+def warm_up_rembg_session():
+    global REMBG_SESSION
+    if REMBG_SESSION is None:
+        print("⚡ Pre-warming lightweight u2netp Rembg model session...")
+        REMBG_SESSION = new_session("u2netp")
+        # Run dummy inference to warm up PyTorch/ONNX runtime
+        dummy_img = Image.new("RGBA", (100, 100), (255, 255, 255, 255))
+        remove(dummy_img, session=REMBG_SESSION)
+        print("✅ Rembg session pre-warmed and ready for 10x fast processing!")
+
+def get_rembg_session():
+    global REMBG_SESSION
+    if REMBG_SESSION is None:
+        warm_up_rembg_session()
+    return REMBG_SESSION
+
+# Thread lock for serial generator
+SERIAL_LOCK = threading.Lock()
+
+# Conversation States for 100% Inline Driven Flow
+(
+    MENU,
+    WAIT_RECEIPT,
+    SETTINGS,
+    BATCH_MODE,
+    WAIT_BROADCAST,
+    WAIT_USER_BALANCE,
+    WAIT_PRICE_SETTING,
+    WAIT_DIRECT_MSG,
+    WAIT_CUSTOM_PRICE,
+    WAIT_BAN_UNBAN
+) = range(10)
 
 
-# 1. DATABASE LOGIC
+# ==========================================
+# 1. DATABASE & ENHANCED USER MANAGEMENT
+# ==========================================
 
-def init_db():
-    conn = sqlite3.connect('users.db')
+def get_db_connection(db_file='users.db'):
+    conn = sqlite3.connect(db_file, timeout=15.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db(db_file='users.db'):
+    conn = get_db_connection(db_file)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, credits INTEGER DEFAULT 0)''')
+    
+    c.execute("PRAGMA table_info(users)")
+    user_cols = [row['name'] for row in c.fetchall()]
+    if not user_cols:
+        c.execute('''CREATE TABLE users 
+                     (user_id INTEGER PRIMARY KEY, 
+                      balance REAL DEFAULT 0.0, 
+                      total_converted INTEGER DEFAULT 0,
+                      is_banned INTEGER DEFAULT 0,
+                      custom_price REAL DEFAULT NULL)''')
+    else:
+        if 'balance' not in user_cols:
+            try:
+                if 'credits' in user_cols:
+                    c.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0")
+                    c.execute("UPDATE users SET balance = credits * 40.0")
+                else:
+                    c.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0")
+            except sqlite3.OperationalError:
+                pass
+        if 'total_converted' not in user_cols:
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN total_converted INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+        if 'is_banned' not in user_cols:
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+        if 'custom_price' not in user_cols:
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN custom_price REAL DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass
+
+    c.execute('''CREATE TABLE IF NOT EXISTS receipts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  raw_text TEXT UNIQUE,
+                  cbe_link TEXT UNIQUE,
+                  reference TEXT UNIQUE,
+                  amount REAL NOT NULL DEFAULT 0.0,
+                  status TEXT NOT NULL DEFAULT 'PENDING',
+                  manual_note TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL)''')
+
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("pdf_to_id_price", DEFAULT_PDF_PRICE_VAL))
+    
     conn.commit()
     conn.close()
 
-def get_credits(user_id):
-    conn = sqlite3.connect('users.db')
+def get_all_user_ids(db_file='users.db'):
+    conn = get_db_connection(db_file)
     c = conn.cursor()
-    c.execute("SELECT credits FROM users WHERE user_id=?", (user_id,))
+    c.execute("SELECT user_id FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return [r['user_id'] for r in rows]
+
+def get_system_stats(db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) as user_count, SUM(balance) as total_bal, SUM(total_converted) as total_ids FROM users")
+    u_row = c.fetchone()
+    c.execute("SELECT COUNT(*) as pending_cnt FROM receipts WHERE status='PENDING'")
+    r_row = c.fetchone()
+    c.execute("SELECT COUNT(*) as banned_cnt FROM users WHERE is_banned=1")
+    b_row = c.fetchone()
+    conn.close()
+    return {
+        "users": u_row['user_count'] or 0,
+        "total_balance": u_row['total_bal'] or 0.0,
+        "total_converted": u_row['total_ids'] or 0,
+        "pending_receipts": r_row['pending_cnt'] or 0,
+        "banned_users": b_row['banned_cnt'] or 0
+    }
+
+def get_setting(key, default=DEFAULT_PDF_PRICE_VAL, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row['value'] if row else default
+
+def set_setting(key, value, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              (key, str(value)))
+    conn.commit()
+    conn.close()
+
+def get_pdf_price(db_file='users.db'):
+    try:
+        return float(get_setting("pdf_to_id_price", DEFAULT_PDF_PRICE_VAL, db_file))
+    except ValueError:
+        return 40.0
+
+def get_user_effective_price(user_id, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT custom_price FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row and row['custom_price'] is not None:
+        return float(row['custom_price'])
+    return get_pdf_price(db_file)
+
+def is_user_banned(user_id, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row and row['is_banned'] == 1)
+
+def set_user_ban(user_id, banned=True, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_converted) VALUES (?, 0.0, 0)", (user_id,))
+    c.execute("UPDATE users SET is_banned=? WHERE user_id=?", (1 if banned else 0, user_id))
+    conn.commit()
+    conn.close()
+
+def set_user_custom_price(user_id, price, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_converted) VALUES (?, 0.0, 0)", (user_id,))
+    val = float(price) if price is not None else None
+    c.execute("UPDATE users SET custom_price=? WHERE user_id=?", (val, user_id))
+    conn.commit()
+    conn.close()
+
+def get_user_info(user_id, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT balance, total_converted, is_banned, custom_price FROM users WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    if not res:
+        c.execute("INSERT INTO users (user_id, balance, total_converted) VALUES (?, 0.0, 0)", (user_id,))
+        conn.commit()
+        conn.close()
+        return 0.0, 0
+    conn.close()
+    return float(res['balance']), int(res['total_converted'])
+
+def add_balance(user_id, amount, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_converted) VALUES (?, 0.0, 0)", (user_id,))
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+def deduct_balance(user_id, amount, converted_count=1, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    if not res or float(res['balance']) < amount:
+        conn.close()
+        return False
+    c.execute("UPDATE users SET balance = balance - ?, total_converted = total_converted + ? WHERE user_id = ?",
+              (amount, converted_count, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+# ==========================================
+# 1.1 SUPABASE RECEIPT DE-DUPLICATION ENGINE
+# ==========================================
+
+def is_receipt_used_supabase(raw_text, cbe_link=None, reference=None):
+    """Query shared Supabase database across multiple bots to prevent receipt re-use."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False
+    try:
+        base_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{SUPABASE_TABLE}"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}"
+        }
+        conds = []
+        if raw_text: conds.append(f"raw_text.eq.{raw_text}")
+        if cbe_link: conds.append(f"cbe_link.eq.{cbe_link}")
+        if reference: conds.append(f"reference.eq.{reference}")
+        if not conds: return False
+
+        or_query = ",".join(conds)
+        resp = requests.get(f"{base_url}?or=({or_query})&select=id", headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return len(data) > 0
+    except Exception as e:
+        print(f"⚠️ Supabase query error: {e}")
+    return False
+
+def record_receipt_supabase(user_id, raw_text, cbe_link, reference, amount, status, manual_note=None):
+    """Record receipt entry to shared Supabase cloud database."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        base_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{SUPABASE_TABLE}"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+        payload = {
+            "user_id": str(user_id),
+            "raw_text": raw_text,
+            "cbe_link": cbe_link,
+            "reference": reference,
+            "amount": float(amount),
+            "status": status,
+            "manual_note": manual_note
+        }
+        requests.post(base_url, json=payload, headers=headers, timeout=5)
+    except Exception as e:
+        print(f"⚠️ Supabase record error: {e}")
+
+def receipt_already_used(raw_text, cbe_link=None, reference=None, db_file='users.db'):
+    # 1. Check Local SQLite Database
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    query = """
+        SELECT 1 FROM receipts
+        WHERE raw_text = ?
+           OR (? IS NOT NULL AND cbe_link = ?)
+           OR (? IS NOT NULL AND reference = ?)
+        LIMIT 1
+    """
+    c.execute(query, (raw_text, cbe_link, cbe_link, reference, reference))
     res = c.fetchone()
     conn.close()
-    return res[0] if res else 0
+    if res is not None:
+        return True
 
-def add_credits(user_id, amount):
-    conn = sqlite3.connect('users.db')
+    # 2. Check Shared Supabase Database across all bots/projects
+    if is_receipt_used_supabase(raw_text, cbe_link, reference):
+        return True
+
+    return False
+
+def record_receipt(user_id, raw_text, cbe_link, reference, amount, status, manual_note=None, db_file='users.db'):
+    conn = get_db_connection(db_file)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id, credits) VALUES (?, 0)", (user_id,))
-    c.execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (amount, user_id))
+    try:
+        c.execute("""
+            INSERT INTO receipts (user_id, raw_text, cbe_link, reference, amount, status, manual_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, raw_text, cbe_link, reference, amount, status, manual_note))
+        rec_id = c.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Also sync to shared Supabase DB across projects
+        record_receipt_supabase(user_id, raw_text, cbe_link, reference, amount, status, manual_note)
+
+        return rec_id
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None
+
+def approve_receipt(receipt_id, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT user_id, amount, status, raw_text, cbe_link, reference FROM receipts WHERE id=?", (receipt_id,))
+    row = c.fetchone()
+    if not row or row['status'] != 'PENDING':
+        conn.close()
+        return None
+    
+    user_id = row['user_id']
+    amount = float(row['amount'])
+    
+    c.execute("UPDATE receipts SET status='VERIFIED' WHERE id=?", (receipt_id,))
+    c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_converted) VALUES (?, 0.0, 0)", (user_id,))
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
     conn.close()
 
+    # Sync approval to Supabase
+    record_receipt_supabase(user_id, row['raw_text'], row['cbe_link'], row['reference'], amount, "VERIFIED")
 
-# 2. PDF & ID LOGIC (Preserving your exact extraction)
+    return user_id, amount
+
+def reject_receipt(receipt_id, db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT user_id, status FROM receipts WHERE id=?", (receipt_id,))
+    row = c.fetchone()
+    if not row or row['status'] != 'PENDING':
+        conn.close()
+        return None
+    user_id = row['user_id']
+    c.execute("UPDATE receipts SET status='REJECTED' WHERE id=?", (receipt_id,))
+    conn.commit()
+    conn.close()
+    return user_id
+
+def fetch_pending_receipts(db_file='users.db'):
+    conn = get_db_connection(db_file)
+    c = conn.cursor()
+    c.execute("SELECT * FROM receipts WHERE status='PENDING' ORDER BY id ASC LIMIT 5")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# ==========================================
+# 2. 100% DIRECT LOCAL CBE VERIFICATION
+# ==========================================
+
+def check_account_match(got_acc: str, expected_acc: str) -> bool:
+    if not got_acc or not expected_acc:
+        return True
+    got_str = str(got_acc).strip().upper()
+    expected_str = str(expected_acc).strip().upper()
+    if got_str == expected_str:
+        return True
+    if "*" in expected_str:
+        pattern = "^" + re.escape(expected_str).replace(r"\*", r".*") + "$"
+        if re.match(pattern, got_str, re.IGNORECASE):
+            return True
+    got_digits = re.sub(r'[^0-9]', '', got_str)
+    expected_digits = re.sub(r'[^0-9]', '', expected_str)
+    if got_digits and expected_digits:
+        if got_digits == expected_digits:
+            return True
+        if len(got_digits) >= 4 and len(expected_digits) >= 4:
+            if got_digits.endswith(expected_digits[-4:]) or expected_digits.endswith(got_digits[-4:]):
+                return True
+    return False
+
+def check_holder_match(got_holder: str, expected_holder: str) -> bool:
+    if not got_holder or not expected_holder:
+        return True
+    got_clean = str(got_holder).strip().upper()
+    expected_clean = str(expected_holder).strip().upper()
+    return expected_clean in got_clean or got_clean in expected_clean
+
+def is_within_24_hours(tx_date_str: str) -> bool:
+    if not tx_date_str:
+        return True
+    now = datetime.now()
+    parsed_date = None
+    date_formats = [
+        "%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y", "%b %d, %Y", "%d/%m/%y"
+    ]
+    for fmt in date_formats:
+        try:
+            parsed_date = datetime.strptime(tx_date_str.strip()[:19], fmt)
+            break
+        except ValueError:
+            continue
+    if not parsed_date:
+        return True
+    diff = now - parsed_date
+    return diff <= timedelta(hours=24) and diff >= timedelta(days=-1)
+
+def verify_cbe_local(input_text: str, expected_account: str = CBE_EXPECTED_ACCOUNT, expected_holder: str = CBE_EXPECTED_HOLDER) -> dict:
+    link_match = re.search(r'mbreciept\.cbe\.com\.et\/([A-Za-z0-9_-]{6,})', input_text, re.IGNORECASE)
+    if not link_match:
+        return {
+            "ok": False,
+            "code": "MISSING_LINK",
+            "error": "🔗 **የCBE ደረሰኝ ሊንክ አልተገኘም (MISSING LINK)**\n\nለራስ-ሰር ማረጋገጫ የ **mbreciept.cbe.com.et/...** ደረሰኝ ሊንክ የያዘውን ኤስኤምኤስ ብቻ ይላኩ!"
+        }
+
+    short_code = link_match.group(1).strip()
+    cbe_link = f"https://{OFFICIAL_CBE_RECEIPT_HOST}/{short_code}"
+
+    now_ts = datetime.now().timestamp()
+    if short_code in VERIFICATION_CACHE:
+        cache_time, cached_res = VERIFICATION_CACHE[short_code]
+        if now_ts - cache_time < CACHE_TTL_SECONDS:
+            return cached_res
+
+    url = f"https://{OFFICIAL_CBE_DOMAIN}/api/v1/transactions/public/transaction-detail/{short_code}"
+    headers = {
+        'Host': OFFICIAL_CBE_DOMAIN,
+        'Origin': f'https://{OFFICIAL_CBE_RECEIPT_HOST}',
+        'Referer': f'https://{OFFICIAL_CBE_RECEIPT_HOST}/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 CBEBIRR/1.0',
+        'x-app-id': 'd1292e42-7400-49de-a2d3-9731caa4c819',
+        'x-app-version': '0a01980b-9859-1369-8198-59f403820000',
+        'Accept': 'application/json, text/plain, */*'
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            rec_acc = data.get("creditAccountNo", "")
+            rec_holder = data.get("creditAccountHolder", "")
+            
+            if expected_account and not check_account_match(rec_acc, expected_account):
+                return {
+                    "ok": False,
+                    "code": "ACCOUNT_MISMATCH",
+                    "error": f"❌ **የተቀባይ አካውንት ቁጥር አይዛመድም (ACCOUNT MISMATCH)**\n\nይህ ክፍያ የተፈጸመው ወደ አካውንት `({rec_acc})` ነው። እባክዎን ክፍያዎን ወደ አካውንት **{expected_account}** ይክፈሉ።"
+                }
+
+            if expected_holder and not check_holder_match(rec_holder, expected_holder):
+                return {
+                    "ok": False,
+                    "code": "HOLDER_MISMATCH",
+                    "error": f"❌ **የተቀባይ ስም አይዛመድም (NAME MISMATCH)**\n\nይህ ክፍያ የተፈጸመው ወደ **{rec_holder}** ነው። እባክዎን ወደ **{expected_holder}** አካውንት ይክፈሉ።"
+                }
+
+            tx_date = str(data.get("processingDate") or data.get("authDate") or datetime.now().strftime("%Y-%m-%d"))
+            if not is_within_24_hours(tx_date):
+                return {
+                    "ok": False,
+                    "code": "EXPIRED_RECEIPT",
+                    "error": f"🕒 **የቆየ የክፍያ ደረሰኝ (EXPIRED RECEIPT)**\n\nይህ የክፍያ ደረሰኝ የተፈጸመበት ቀን (`{tx_date[:10]}`) ከ 24 ሰዓት በፊት ስለሆነ አይቀበልም። የዛሬ ክፍያ ብቻ ያስገቡ!"
+                }
+
+            amt = float(data.get("amountCredited") or data.get("creditAmount") or 0.0)
+            txn_id = str(data.get("id") or data.get("transactionId") or short_code)
+
+            result = {
+                "ok": True,
+                "provider": "CBE",
+                "short_code": short_code,
+                "cbe_link": cbe_link,
+                "transaction_id": txn_id,
+                "amount": amt,
+                "payer_name": data.get("debitAccountHolder", "Unknown"),
+                "receiver_name": rec_holder,
+                "receiver_account": rec_acc,
+                "date": tx_date
+            }
+            VERIFICATION_CACHE[short_code] = (now_ts, result)
+            return result
+        else:
+            return {
+                "ok": False,
+                "code": "NOT_FOUND",
+                "error": f"⚠️ **ደረሰኙ በንግድ ባንክ ሰርቨር አልተገኘም (NOT FOUND)**\n\nየላኩት የCBE ደረሰኝ ሊንክ በንግድ ባንክ ሰርቨር ላይ አልተገኘም።"
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "code": "NETWORK_ERROR",
+            "error": "⚠️ ከንግድ ባንክ ሰርቨር ጋር ማገናኘት አልተቻለም። እባክዎን ትንሽ ቆይተው እንደገና ይሞክሩ።"
+        }
+
+
+# ==========================================
+# 3. ULTRA-FAST HIGH-PRECISION PDF & IMAGE ENGINE (NON-SEQUENTIAL NUMERIC SERIAL NUMBER)
+# ==========================================
 
 def get_next_serial_number():
-    filename = "serial_counter.txt"
-    if not os.path.exists(filename):
-        with open(filename, "w") as f:
-            f.write("0000000")
-            return "6000000"
-    with open(filename, "r") as f:
-        content = f.read().strip()
-        current_sn = int(content) if content else 7000000
-    next_sn = current_sn + 1
-    with open(filename, "w") as f:
-        f.write(str(next_sn))
-    return str(next_sn)
+    """Generates a randomized non-sequential 7-digit numeric Serial Number (SN) (e.g., 6849201, 7102948)."""
+    with SERIAL_LOCK:
+        first_digit = random.choice(["6", "7", "8"])
+        remaining_digits = "".join(random.choices("0123456789", k=6))
+        return f"{first_digit}{remaining_digits}"
 
-def extract_data_from_pdf(pdf_path, user_id):
+def extract_data_from_pdf(pdf_path, temp_prefix):
     if not os.path.exists(pdf_path): return None
-    doc = fitz.open(pdf_path)
-    page = doc[0]
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[0]
 
-    paths = {'photo': f"photo_{user_id}.png", 'qr': f"qr_{user_id}.png", 
-             'fin': f"fin_{user_id}.png"}
+        paths = {
+            'photo': f"photo_{temp_prefix}.png", 
+            'qr': f"qr_{temp_prefix}.png", 
+            'fin': f"fin_{temp_prefix}.png"
+        }
 
-    image_list = page.get_images(full=True)
-    for i, img in enumerate(image_list):
-        xref = img[0]
-        pix = fitz.Pixmap(doc, xref)
-        if pix.n - pix.alpha > 3: pix = fitz.Pixmap(fitz.csRGB, pix)
+        image_list = page.get_images(full=True)
+        for i, img in enumerate(image_list):
+            xref = img[0]
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n - pix.alpha > 3: pix = fitz.Pixmap(fitz.csRGB, pix)
+            
+            if i == 0:
+                img_bytes = pix.tobytes("png")
+                raw_photo = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+                # Pre-downscale to target resolution (330, 370) BEFORE background removal for 10x SPEEDUP!
+                raw_photo_resized = raw_photo.resize((330, 370), Image.Resampling.LANCZOS)
+                output_image = remove(raw_photo_resized, session=get_rembg_session())
+                output_image.save(paths['photo'])
+            elif i == 1: 
+                pix.save(paths['qr'])
+
+        page.get_pixmap(clip=fitz.Rect(496.5, 493, 540, 501), matrix=fitz.Matrix(4, 4)).save(paths['fin'])
         
-        if i == 0:
-            img_data = pix.tobytes("png")
-            output_image = remove(Image.open(io.BytesIO(img_data)), session=REMBG_SESSION)
-            output_image.save(paths['photo'])
-        elif i == 1: pix.save(paths['qr'])
-
-    page.get_pixmap(clip=fitz.Rect(496.5, 493, 540, 501), matrix=fitz.Matrix(4, 4)).save(paths['fin'])
-    
-    text = page.get_text("text")
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    now = datetime.now()
-    eth_now = EthiopianDateConverter.to_ethiopian(now.year, now.month, now.day)
-    
-    data = {
-        'name_amh': lines[57] if len(lines) > 57 else "Unknown",
-        'name_eng': lines[58] if len(lines) > 58 else "Unknown",
-        'dob': f"{lines[43]} | {lines[44]}" if len(lines) > 44 else "Unknown",
-        'sex': f"{lines[45]} | {lines[46]}" if len(lines) > 46 else "Unknown",
-        'fan': "Unknown", 'sn': get_next_serial_number(),
-        'phone': lines[49] if len(lines) > 49 else "",
-        'address': lines[50:56],
-        'expiry': f"{now.day:02d}/{now.month:02d}/{now.year+10} | {eth_now.day:02d}/{eth_now.month:02d}/{eth_now.year+10}"
-    }
-    for line in lines:
-        clean = line.replace(" ", "")
-        fan_match = re.search(r'(\d{16})', clean)
-        if fan_match: data['fan'] = fan_match.group(1)
-    doc.close()
-    return data
+        text = page.get_text("text")
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        now = datetime.now()
+        eth_now = EthiopianDateConverter.to_ethiopian(now.year, now.month, now.day)
+        
+        data = {
+            'name_amh': lines[57] if len(lines) > 57 else "Unknown",
+            'name_eng': lines[58] if len(lines) > 58 else "Unknown",
+            'dob': f"{lines[43]} | {lines[44]}" if len(lines) > 44 else "Unknown",
+            'sex': f"{lines[45]} | {lines[46]}" if len(lines) > 46 else "Unknown",
+            'fan': "Unknown", 
+            'sn': get_next_serial_number(),
+            'phone': lines[49] if len(lines) > 49 else "",
+            'address': lines[50:56] if len(lines) >= 56 else lines[40:46],
+            'expiry': f"{now.day:02d}/{now.month:02d}/{now.year+10} | {eth_now.day:02d}/{eth_now.month:02d}/{eth_now.year+10}"
+        }
+        for line in lines:
+            clean = line.replace(" ", "")
+            fan_match = re.search(r'(\d{16})', clean)
+            if fan_match: 
+                data['fan'] = fan_match.group(1)
+        doc.close()
+        return data
+    except Exception as e:
+        print(f"Error extracting PDF {pdf_path}: {e}")
+        return None
 
 def load_bold_font(size):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -159,7 +663,6 @@ def load_bold_font(size):
         except Exception:
             continue
     return ImageFont.load_default()
-
 
 def bilateral_alpha_blur(alpha, diameter=15, sigma_color=75, sigma_space=75):
     alpha_arr = np.array(alpha, dtype=np.uint8)
@@ -185,8 +688,7 @@ def bilateral_alpha_blur(alpha, diameter=15, sigma_color=75, sigma_space=75):
     filtered = np.clip(filtered, 0, 255).astype(np.uint8)
     return Image.fromarray(filtered, mode='L')
 
-
-def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=None, qr_size=None):
+def generate_fayda_v3(data, output_path, temp_prefix, mode="color", template_path=None, flipped=False):
     template_candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
     if template_path and os.path.exists(template_path):
         chosen_template = template_path
@@ -194,6 +696,7 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
         chosen_template = next((name for name in template_candidates if os.path.exists(name)), None)
     if not chosen_template:
         return False
+
     canvas = Image.open(chosen_template).convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     f_amh = load_bold_font(26)
@@ -216,8 +719,8 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
     draw_rotated_text(g_date, (22, 7), f_small)
     draw_rotated_text(e_date, (22, 260), f_small)
 
-    # Photo Logic
-    photo_path = f"photo_{user_id}.png"
+    # Photo Logic (Pre-downscaled for fast performance)
+    photo_path = f"photo_{temp_prefix}.png"
     if os.path.exists(photo_path):
         raw_photo = Image.open(photo_path).convert("RGBA")
         if mode == "bw":
@@ -225,31 +728,29 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
             gray = raw_photo.convert("L")
             raw_photo = Image.merge("RGBA", (gray, gray, gray, alpha))
 
-        # Apply bilateral smoothing to the alpha mask to preserve sharpness while smoothing edges.
-        photo_resized = raw_photo.resize((330, 370))
+        photo_resized = raw_photo.resize((330, 370), Image.Resampling.LANCZOS)
         r, g, b, alpha = photo_resized.split()
         alpha = bilateral_alpha_blur(alpha, diameter=15, sigma_color=50, sigma_space=50)
         photo_resized = Image.merge("RGBA", (r, g, b, alpha))
         canvas.paste(photo_resized, (62, 180), photo_resized)
 
-        ghost = raw_photo.resize((110, 130))
+        ghost = raw_photo.resize((110, 130), Image.Resampling.LANCZOS)
         r_g, g_g, b_g, alpha_g = ghost.split()
         alpha_g = bilateral_alpha_blur(alpha_g, diameter=11, sigma_color=40, sigma_space=40)
         ghost = Image.merge("RGBA", (r_g, g_g, b_g, alpha_g))
         canvas.paste(ghost, (850, 480), ghost)
 
-    # Assets (QR, Fingerprint)
-    # Set QR size to 4.15 cm square (convert to pixels at 300 DPI)
+    # Assets (QR 4.15cm @ 1520,60 | Fingerprint @ 1170,508)
     qr_cm = 4.15
     dpi = 300
-    qr_size_var = int(round((qr_cm / 2.54) * dpi))
-    assets = [(f"qr_{user_id}.png", (qr_size_var, qr_size_var), (1520, 60)), (f"fin_{user_id}.png", (240, 50), (1170, 508))]
+    qr_size_var = int(round((qr_cm / 2.54) * dpi))  # 490x490
+    assets = [(f"qr_{temp_prefix}.png", (qr_size_var, qr_size_var), (1520, 60)), (f"fin_{temp_prefix}.png", (240, 50), (1170, 508))]
     for asset, size, pos in assets:
         if os.path.exists(asset):
-            img = Image.open(asset).resize(size).convert("RGBA")
+            img = Image.open(asset).resize(size, Image.Resampling.LANCZOS).convert("RGBA")
             canvas.paste(img, pos, img)
 
-    # Main Text Overlay
+    # Main Text Overlay (text_x = 402)
     text_x = 402
     draw.text((text_x, 177), data['name_amh'], font=f_amh, fill="black")
     draw.text((text_x, 219), data['name_eng'], font=f_bold, fill="black")
@@ -259,84 +760,61 @@ def generate_fayda_v3(data, output_path, user_id, mode="color", template_path=No
     draw.text((470, 490), data['fan'], font=f_bold, fill="black")
     draw.text((canvas.width - 180, canvas.height - 56), data['sn'], font=f_bold, fill="black")
 
+    # Back Side Text Overlay
     back_x, y_addr = (canvas.width // 2) + 26, 234
     draw.text((back_x, 71), data['phone'], font=f_bold, fill="black")
     for line in data['address']:
         draw.text((back_x, y_addr), line, font=f_amh, fill="black")
         y_addr += 40
 
-    # Flip the final composed output for all generated images
-    canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
+    if flipped:
+        canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
 
-    # Save as PDF if filename extension requests it, otherwise default to PNG
-    # Save output as PNG
     rgb = canvas.convert("RGB")
     rgb.save(output_path, "PNG")
     return True
 
+
+# ==========================================
+# 4. A4 SHEET PRINTABLE ENGINE
+# ==========================================
+
 def arrange_cards_on_a4(card_paths, output_path, num_cards=5):
-    """
-    Arrange ID cards (2-5) on one A4 page with proper cutting gaps.
-    
-    Layout:
-    - A4: 2480 × 3508 px (210mm × 297mm at 300 DPI)
-    - Cards: 1000 × 640 px each (aspect ratio 1.57:1 preserved)
-    - Cutting gaps: 40 px between each card (white space for cutting)
-    - Cards are vertically arranged, one per row, centered horizontally
-    - Supports 2, 3, 4, or 5 cards per page
-    """
-    # A4 dimensions at 300 DPI: 2480 x 3508 pixels
     a4_width, a4_height = 2480, 3508
     a4_canvas = Image.new("RGB", (a4_width, a4_height), color="white")
     
-    # Validate num_cards
-    num_cards = max(2, min(5, num_cards))  # Ensure between 2-5
-    
-    # Card dimensions with aspect ratio 1.57:1
+    num_cards = max(1, min(5, num_cards))
     card_width, card_height = 1000, 640
+    cutting_gap = 40
     
-    # Cutting gap between cards (white space for easy cutting)
-    cutting_gap = 40  # pixels
-    
-    # Calculate optimal margins based on number of cards
-    # Total height needed: margin_top + (num_cards * card_height) + ((num_cards-1) * cutting_gap) + margin_bottom
     total_card_height = (num_cards * card_height) + ((num_cards - 1) * cutting_gap)
     total_margin = a4_height - total_card_height
-    margin_top = max(50, total_margin // 3)  # Top third of remaining space
-    margin_bottom = a4_height - margin_top - total_card_height
+    margin_top = max(50, total_margin // 3)
     
-    # Calculate horizontal center position
     center_x = (a4_width - card_width) // 2
     
-    # Calculate vertical positions
     current_y = margin_top
     positions = []
     for i in range(num_cards):
         positions.append((center_x, current_y))
         current_y += card_height + cutting_gap
     
-    # Paste cards onto A4 canvas
     for i, card_path in enumerate(card_paths[:num_cards]):
         if i < len(positions) and os.path.exists(card_path):
             try:
                 card_img = Image.open(card_path).convert("RGB")
-                
-                # Resize card proportionally to fit target dimensions while preserving aspect ratio
                 original_aspect = card_img.width / card_img.height
                 target_aspect = card_width / card_height
                 
                 if original_aspect > target_aspect:
-                    # Image is wider - scale by height
                     scale = card_height / card_img.height
                 else:
-                    # Image is taller - scale by width
                     scale = card_width / card_img.width
                 
                 new_width = int(card_img.width * scale)
                 new_height = int(card_img.height * scale)
                 card_img_resized = card_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 
-                # Center the resized card on the target area
                 offset_x = (card_width - new_width) // 2
                 offset_y = (card_height - new_height) // 2
                 
@@ -345,762 +823,930 @@ def arrange_cards_on_a4(card_paths, output_path, num_cards=5):
             except Exception as e:
                 print(f"Error pasting card {i}: {e}")
     
-    # Save as high-quality PNG
     a4_canvas.save(output_path, "PNG", quality=95)
     return True
 
-def arrange_5_cards_on_a4(card_paths, output_path):
-    """Backward compatibility wrapper for 5 cards"""
-    return arrange_cards_on_a4(card_paths, output_path, num_cards=5)
 
 # ==========================================
-# 3. UI HELPERS - INLINE & REPLY KEYBOARDS
+# 5. HYBRID KEYBOARDS & LAYOUTS FOR BUTTON PERSISTENCE
 # ==========================================
 
-# INLINE KEYBOARDS (Edit-able buttons)
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🖨 Print ID", callback_data='print_id')],
-                                 [InlineKeyboardButton("💳 Buy Package", callback_data='buy_package')],
-                                 [InlineKeyboardButton("📞 Contact Help", callback_data='contact_help')]])
-
-def package_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("40 birr = 1 package", callback_data='pkg_1')],
-                                 [InlineKeyboardButton("500 birr = 25 packages", callback_data='pkg_20')],
-                                 [InlineKeyboardButton("1500 birr = 100 packages", callback_data='pkg_100')],
-                                 [InlineKeyboardButton("2000 birr = 155 packages", callback_data='pkg_150')]])
-
-# REPLY KEYBOARDS (persistent buttons for quick access)
-def main_menu_reply_keyboard():
-    """Quick access reply buttons for main menu"""
+def main_reply_keyboard():
+    """Persistent Bottom Reply Keyboard Fallback so buttons NEVER disappear!"""
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🖨 Print ID"), KeyboardButton("� Batch (5x A4)")],
-        [KeyboardButton("⚙️ Settings"), KeyboardButton("📞 Help")],
-        [KeyboardButton("💰 Balance")]
-    ], resize_keyboard=True, one_time_keyboard=False)
-def print_now_keyboard():
-    """Inline keyboard with Print Now button"""
+        [KeyboardButton("📋 Control Panel"), KeyboardButton("📄 Direct Print")],
+        [KeyboardButton("📦 Bulk Mode"), KeyboardButton("💳 Deposit / Balance")],
+        [KeyboardButton("📞 Support & Help")]
+    ], resize_keyboard=True)
+
+def main_menu_inline_keyboard(is_admin=False):
+    kb = [
+        [InlineKeyboardButton("📄 Direct Print (Drop 1 PDF)", callback_data='btn_single_info')],
+        [InlineKeyboardButton("📦 Interactive Bulk Mode (1-5 PDFs)", callback_data='btn_start_bulk')],
+        [InlineKeyboardButton("💰 My Wallet Balance", callback_data='btn_wallet'), InlineKeyboardButton("⚙️ Settings", callback_data='btn_settings')],
+        [InlineKeyboardButton("💳 Deposit Funds (CBE Direct)", callback_data='btn_deposit'), InlineKeyboardButton("📞 Support", callback_data='btn_help')]
+    ]
+    if is_admin:
+        kb.append([InlineKeyboardButton("🛠 ADMIN CONTROL DASHBOARD", callback_data='btn_admin_dashboard')])
+    return InlineKeyboardMarkup(kb)
+
+def admin_dashboard_inline_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖨️ Print Now", callback_data="print_now")]
+        [InlineKeyboardButton("📊 Analytics", callback_data='admin_stats'), InlineKeyboardButton("🏷 Set Global Price", callback_data='admin_set_price')],
+        [InlineKeyboardButton("👥 Adjust User Balance", callback_data='admin_user_adjust'), InlineKeyboardButton("🏷 Set Custom User Price", callback_data='admin_custom_price')],
+        [InlineKeyboardButton("🚫 Ban / Unban User", callback_data='admin_ban_unban'), InlineKeyboardButton("💬 Send Direct Msg", callback_data='admin_direct_msg')],
+        [InlineKeyboardButton("🧾 Review Receipts", callback_data='admin_review_receipts'), InlineKeyboardButton("📢 Broadcast All", callback_data='admin_broadcast')],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data='btn_main_menu')]
     ])
 
-def batch_card_count_keyboard():
-    """Keyboard to select number of cards per A4 page"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("2️⃣ 2 Cards per A4"), KeyboardButton("3️⃣ 3 Cards per A4")],
-        [KeyboardButton("4️⃣ 4 Cards per A4"), KeyboardButton("5️⃣ 5 Cards per A4")],
-        [KeyboardButton("❌ Cancel")]
-    ], resize_keyboard=True, one_time_keyboard=True)
-def cancel_keyboard():
-    """Quick cancel button"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("❌ Cancel")]
-    ], resize_keyboard=True, one_time_keyboard=True)
-
-def confirm_keyboard():
-    """Confirm/Cancel buttons"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("✅ Confirm"), KeyboardButton("❌ Cancel")]
-    ], resize_keyboard=True, one_time_keyboard=True)
-
-def remove_keyboard():
-    """Remove all reply keyboards"""
-    return ReplyKeyboardRemove()
-
-
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display settings menu from /settings command"""
-    user_id = update.message.from_user.id
-    current_tpl = context.user_data.get('template_choice', 'default')
-    current_mode = context.user_data.get('output_mode', 'color')
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Template Choice", callback_data='set_template')],
-        [InlineKeyboardButton("Output Mode", callback_data='set_mode')],
-        [InlineKeyboardButton("Back", callback_data='back_main')]
+def bulk_interactive_keyboard(count=0):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🖨️ Convert Now ({count} PDFs Ready)", callback_data='bulk_convert_now')],
+        [InlineKeyboardButton("❌ Cancel Batch", callback_data='bulk_cancel')]
     ])
-    settings_text = (
-        f"⚙️ **Settings**\n\n"
-        f"📋 Template: `{current_tpl}`\n"
-        f"🎨 Output Mode: `{current_mode}`\n\n"
-        f"Choose an option below:"
+
+def settings_keyboard(context):
+    mode = context.user_data.get('output_mode', 'color')
+    flip = context.user_data.get('canvas_flip', 'normal')
+    
+    mode_btn_text = "🟢 Mode: COLOR (Click for B/W)" if mode == 'color' else "⚪ Mode: B/W (Click for COLOR)"
+    flip_btn_text = "🔄 Canvas: NORMAL (Click for FLIPPED)" if flip == 'normal' else "🪞 Canvas: FLIPPED (Click for NORMAL)"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mode_btn_text, callback_data='toggle_mode')],
+        [InlineKeyboardButton(flip_btn_text, callback_data='toggle_flip')],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data='btn_main_menu')]
+    ])
+
+
+# ==========================================
+# 6. SMART HANDLERS & INLINE FLOWS
+# ==========================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if is_user_banned(user_id):
+        banned_msg = f"🚫 **Your account has been restricted / banned by Admin.**\n\nFor support or unban inquiries, contact: {SUPPORT_USERNAME}"
+        if update.callback_query:
+            await update.callback_query.answer("🚫 Account Banned", show_alert=True)
+            try:
+                await update.callback_query.edit_message_text(banned_msg, parse_mode="Markdown")
+            except Exception:
+                await context.bot.send_message(chat_id=user_id, text=banned_msg, reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(banned_msg, reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+        return MENU
+
+    balance, total_converted = get_user_info(user_id)
+    price = get_user_effective_price(user_id)
+    global_price = get_pdf_price()
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+
+    context.user_data.setdefault('output_mode', 'color')
+    context.user_data.setdefault('canvas_flip', 'normal')
+
+    mode_str = "🟢 COLOR" if context.user_data['output_mode'] == 'color' else "⚪ B/W"
+    flip_str = "🔄 NORMAL" if context.user_data['canvas_flip'] == 'normal' else "🪞 FLIPPED"
+    
+    price_tag = f"`{price:.2f} ETB`" if price == global_price else f"`{price:.2f} ETB` *(Custom Discount!)*"
+
+    welcome_text = (
+        "⚡ **FAYDA ID PRINTABLE CONVERTER BOT** ⚡\n"
+        "እንኳን ወደ ብሔራዊ መታወቂያ ፋይዳ ካርድ መቀየሪያ በደህና መጡ!\n\n"
+        f"💰 **Wallet Balance:** `{balance:.2f} ETB`\n"
+        f"🏷 **Rate per ID:** {price_tag}\n"
+        f"⚙️ **Active Preferences:** {mode_str} | {flip_str}\n"
+        f"🪪 **Total IDs Processed:** `{total_converted}`\n\n"
+        "🚀 **Fast Single PDF:** Drop 1 Fayda PDF directly in chat for instant conversion!\n"
+        "📦 **Interactive Bulk Mode:** Upload 1 to 5 PDFs and tap **Convert Now** at any step!\n\n"
+        "👇 **Select an option below:**"
     )
-    await update.message.reply_text(settings_text, reply_markup=kb, parse_mode="Markdown")
-    return SETTINGS
+    
+    if update.callback_query:
+        await update.callback_query.answer()
+        try:
+            await update.callback_query.edit_message_text(welcome_text, reply_markup=main_menu_inline_keyboard(is_admin), parse_mode="Markdown")
+        except Exception:
+            await context.bot.send_message(chat_id=user_id, text=welcome_text, reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(welcome_text, reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text("📋 **Interactive Control Panel:**", reply_markup=main_menu_inline_keyboard(is_admin), parse_mode="Markdown")
+    return MENU
 
-async def show_settings_menu(query, context: ContextTypes.DEFAULT_TYPE):
-    """Display settings menu from callback query"""
-    current_tpl = context.user_data.get('template_choice', 'default')
-    current_mode = context.user_data.get('output_mode', 'color')
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Template Choice", callback_data='set_template')],
-        [InlineKeyboardButton("Output Mode", callback_data='set_mode')],
-        [InlineKeyboardButton("Back", callback_data='back_main')]
-    ])
-    settings_text = (
-        f"⚙️ **Settings**\n\n"
-        f"📋 Template: `{current_tpl}`\n"
-        f"🎨 Output Mode: `{current_mode}`\n\n"
-        f"Choose an option below:"
-    )
-    await query.edit_message_text(settings_text, reply_markup=kb, parse_mode="Markdown")
-
-
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    # Show template options
-    if data == 'set_template':
-        candidates = ["fayda.jpg", "Fayda.jpg", "faydatemplate1.jpg", "faydatemplate1.png", "Templet2.png", "Templet2.jpg"]
-        buttons = [[InlineKeyboardButton(os.path.basename(c), callback_data=f"tpl:{os.path.basename(c)}")] for c in candidates if os.path.exists(c)]
-        buttons.append([InlineKeyboardButton("Back", callback_data='back_settings')])
-        if not buttons:
-            await query.edit_message_text("No templates found in the working directory.")
-            return
-        await query.edit_message_text("📋 Choose a template:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        return
-    if data.startswith('tpl:'):
-        chosen = data.split(':', 1)[1]
-        context.user_data['template_choice'] = chosen
-        await query.edit_message_text(f"✅ Template set to `{chosen}`", parse_mode="Markdown")
-        await asyncio.sleep(1)
-        await show_settings_menu(query, context)
-        return
-    # Output mode options
-    if data == 'set_mode':
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Color", callback_data='mode:color')],
-            [InlineKeyboardButton("B/W", callback_data='mode:bw')],
-            [InlineKeyboardButton("Back", callback_data='back_settings')]
-        ])
-        await query.edit_message_text("🎨 Choose output mode:", reply_markup=kb, parse_mode="Markdown")
-        return
-    if data.startswith('mode:'):
-        val = data.split(':', 1)[1]
-        if val in ['color', 'bw']:
-            context.user_data['output_mode'] = val
-            await query.edit_message_text(f"✅ Output mode set to `{val}`", parse_mode="Markdown")
-            await asyncio.sleep(1)
-            await show_settings_menu(query, context)
-        else:
-            await query.edit_message_text("Invalid mode")
-        return
-    if data == 'back_settings':
-        await show_settings_menu(query, context)
-        return
-    if data == 'back_main':
-        await query.edit_message_text("Back to main menu.", reply_markup=main_menu_keyboard())
-        return MENU
-
-
-# 4. BOT HANDLERS
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    credits = get_credits(user_id)
-    welcome = (
-        "Welcome to the National ID Fayda Printable Converter Service! 🎉\n\n"
-        "📑 **To get your printable ID card:**\n"
-        "1. Download the FAYDA ID pdf from FAYDA app  OR Telebirr \n"
-        "2. Send the downloaded PDF file here to this bot.\n\n"
-        "እንኳን ወደ ብሔራዊ መታወቂያ ፋይዳ ካርድ ሊታተም የሚችል መቀየሪያ አገልግሎት በደህና መጡ! 🎉\n"
-        "🪪 ሊታተም የሚችል መታወቂያ ካርድዎን ለማግኘት፡-\n"
-       "1. የFAYDA መታወቂያ ፒዲኤፍ ከFAYDA መተግበሪያ ወይም ከTelebirr ያውርዱ \n"
-       "2. የወረደውን የፒዲኤፍ ፋይል ወደዚህ ቦት ይላኩ።\n\n"
-       "Baga Gara Tajaajila Jijjiirraa Maxxanfamuu Danda'u FAYDA Eenyummaa Biyyaalessaatti dhuftan! 🎉\n\n" 
-"📑 NATIONAL ID  maxxanfamuu danda'u argachuuf:**\n" 
-"1. ID FAYDA pdf appii FAYDA YKN Telebirr irraa buufadhaa \n" 
-"2. Faayila PDF buufame as gara bot kanaatti ergi.\n\n"
-        f"💰 **Your Balance:** {credits} packages"
-    )
-    await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=main_menu_reply_keyboard())
-    return MENU
-
-async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
-    
-    if query.data == 'buy_package':
-        if user_id == ADMIN_ID:
-            await query.edit_message_text(
-                "✅ **Admin - Free Access**\n\n"
-                "You have unlimited free access to print ID cards.\n\n"
-                "🎉 No packages needed!",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data='back_main')]])
-            )
-        else:
-            await query.edit_message_text(
-                "💳 **Payment Coming Soon**\n\n"
-                "Telebirr and Bank payment integration is coming very soon!\n\n"
-                "Thank you for your patience.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data='back_main')]])
-            )
-        return MENU
-    elif query.data == 'print_id':
-        await query.message.reply_text("📄 Please send your Fayda PDF file now.", reply_markup=cancel_keyboard())
-        return MENU
-    elif query.data == 'contact_help':
-        await query.edit_message_text("📞 **Support Information**\n\nFor assistance, contact: @altleg\n\nResponse time: Usually within 24 hours", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data='back_main')]]))
+
+    if is_user_banned(user_id):
+        await query.answer("🚫 Account Banned", show_alert=True)
         return MENU
 
-async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle reply keyboard button presses"""
-    text = update.message.text
-    user_id = update.message.from_user.id
-    
-    if text == "🖨 Print ID":
-        await update.message.reply_text("📄 Please send your Fayda PDF file now.", reply_markup=cancel_keyboard())
+    balance, _ = get_user_info(user_id)
+    price = get_user_effective_price(user_id)
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+
+    if data == 'btn_single_info':
+        await query.edit_message_text(
+            f"📄 **Direct Single PDF Mode**\n\n"
+            f"Simply send your **Fayda ID PDF** file directly in chat!\n"
+            f"💰 Cost per ID: `{price:.2f} ETB` | Your Balance: `{balance:.2f} ETB`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data='btn_main_menu')]]),
+            parse_mode="Markdown"
+        )
         return MENU
-    elif text == "� Batch (5x A4)":
-        if user_id != ADMIN_ID:
-            await update.message.reply_text(
-                "🔒 **Service Coming Soon**\n\n"
-                "Batch processing available only in beta.",
-                parse_mode="Markdown",
-                reply_markup=main_menu_reply_keyboard()
+
+    elif data == 'btn_start_bulk':
+        context.user_data['batch_pdfs'] = []
+        await query.edit_message_text(
+            "📦 **INTERACTIVE BULK MODE (1 to 5 PDFs)**\n\n"
+            "Progress: `[░░░░░] 0/5 PDFs`\n\n"
+            "📥 Please send PDF 1/5 now.\n"
+            "💡 Tap **🖨️ Convert Now** at any time to print collected PDFs!",
+            reply_markup=bulk_interactive_keyboard(0),
+            parse_mode="Markdown"
+        )
+        return BATCH_MODE
+
+    elif data == 'btn_wallet':
+        wallet_msg = (
+            f"💳 **YOUR WALLET ACCOUNT**\n\n"
+            f"👤 **User ID:** `{user_id}`\n"
+            f"💰 **Available Balance:** `{balance:.2f} ETB`\n"
+            f"🏷 **Your Current Rate:** `{price:.2f} ETB` / ID\n\n"
+            f"🏦 Deposit automatically by pasting your CBE SMS receipt link (`mbreciept.cbe.com.et...`)\n"
+            f"💳 **CBE Receiver Account:** `{CBE_EXPECTED_ACCOUNT}` ({CBE_EXPECTED_HOLDER})\n"
+            f"📱 **Telebirr Transfer:** `{TELEBIRR_NUMBER}`"
+        )
+        btns = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Deposit Funds", callback_data='btn_deposit')],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data='btn_main_menu')]
+        ])
+        await query.edit_message_text(wallet_msg, reply_markup=btns, parse_mode="Markdown")
+        return MENU
+
+    elif data == 'btn_settings':
+        await query.edit_message_text(
+            "⚙️ **SETTINGS & PREFERENCES**\n\nConfigure your visual output preferences below:",
+            reply_markup=settings_keyboard(context),
+            parse_mode="Markdown"
+        )
+        return SETTINGS
+
+    elif data == 'toggle_mode':
+        curr = context.user_data.get('output_mode', 'color')
+        context.user_data['output_mode'] = 'bw' if curr == 'color' else 'color'
+        await query.edit_message_text(
+            "⚙️ **SETTINGS & PREFERENCES**\n\nUpdated settings:",
+            reply_markup=settings_keyboard(context),
+            parse_mode="Markdown"
+        )
+        return SETTINGS
+
+    elif data == 'toggle_flip':
+        curr = context.user_data.get('canvas_flip', 'normal')
+        context.user_data['canvas_flip'] = 'flipped' if curr == 'normal' else 'normal'
+        await query.edit_message_text(
+            "⚙️ **SETTINGS & PREFERENCES**\n\nUpdated settings:",
+            reply_markup=settings_keyboard(context),
+            parse_mode="Markdown"
+        )
+        return SETTINGS
+
+    elif data == 'btn_deposit':
+        dep_msg = (
+            f"➕ **DEPOSIT FUNDS (100% DIRECT LOCAL CBE VERIFIER)**\n\n"
+            f"🏦 **Commercial Bank of Ethiopia (CBE Direct Verification):**\n"
+            f"📌 **Account:** `{CBE_EXPECTED_ACCOUNT}`\n"
+            f"👤 **Holder Name:** `{CBE_EXPECTED_HOLDER}`\n"
+            f"📱 **Telebirr Number:** `{TELEBIRR_NUMBER}`\n\n"
+            f"Transfer money to CBE and paste your **SMS Receipt link** (e.g. `https://mbreciept.cbe.com.et/...`) directly in chat.\n\n"
+            f"⚡ It will directly verify with CBE official server and credit your wallet instantly!"
+        )
+        btns = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data='btn_main_menu')]])
+        await query.edit_message_text(dep_msg, reply_markup=btns, parse_mode="Markdown")
+        return WAIT_RECEIPT
+
+    elif data == 'btn_help':
+        await query.edit_message_text(
+            f"📞 **CUSTOMER SUPPORT**\n\nFor assistance or inquiries, contact: {SUPPORT_USERNAME}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data='btn_main_menu')]]),
+            parse_mode="Markdown"
+        )
+        return MENU
+
+    elif data == 'btn_admin_dashboard':
+        if not is_admin:
+            await query.edit_message_text("❌ Access denied. Admin permissions required.")
+            return MENU
+        stats = get_system_stats()
+        adm_msg = (
+            f"🛠 **ADMIN CONTROL DASHBOARD**\n\n"
+            f"👥 **Total Registered Users:** `{stats['users']}`\n"
+            f"💰 **Total System Balance:** `{stats['total_balance']:.2f} ETB`\n"
+            f"🪪 **Total IDs Converted:** `{stats['total_converted']}`\n"
+            f"⏳ **Pending Receipts:** `{stats['pending_receipts']}`\n"
+            f"🚫 **Banned Users:** `{stats['banned_users']}`\n"
+            f"🏷 **Global PDF Price:** `{get_pdf_price():.2f} ETB`\n\n"
+            f"Choose an admin control action below:"
+        )
+        await query.edit_message_text(adm_msg, reply_markup=admin_dashboard_inline_keyboard(), parse_mode="Markdown")
+        return MENU
+
+    elif data == 'admin_stats':
+        if not is_admin: return MENU
+        stats = get_system_stats()
+        msg = (
+            f"📊 **SYSTEM ANALYTICS REPORT**\n\n"
+            f"👥 **Active Users:** `{stats['users']}`\n"
+            f"💰 **Total Wallet Balances:** `{stats['total_balance']:.2f} ETB`\n"
+            f"🪪 **Total IDs Rendered:** `{stats['total_converted']}`\n"
+            f"🚫 **Banned Users:** `{stats['banned_users']}`\n"
+            f"📄 **Global Price / ID:** `{get_pdf_price():.2f} ETB`"
+        )
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data='btn_admin_dashboard')]]), parse_mode="Markdown")
+        return MENU
+
+    elif data == 'admin_set_price':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "🏷 **SET GLOBAL PDF CONVERSION PRICE**\n\nPlease enter the new global price per PDF ID in ETB (e.g. `40` or `35`):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_PRICE_SETTING
+
+    elif data == 'admin_user_adjust':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "👥 **USER BALANCE ADJUSTER**\n\nPlease enter target User ID and amount to add/deduct:\nFormat: `USER_ID AMOUNT` (e.g. `12345678 100` or `12345678 -50`)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_USER_BALANCE
+
+    elif data == 'admin_custom_price':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "🏷 **SET CUSTOM PER-USER PRICE**\n\nPlease enter target User ID and custom price:\nFormat: `USER_ID PRICE` (e.g. `12345678 30` or `12345678 reset`)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_CUSTOM_PRICE
+
+    elif data == 'admin_ban_unban':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "🚫 **BAN / UNBAN USER CONTROL**\n\nPlease enter target User ID and action:\nFormat: `USER_ID ban` or `USER_ID unban` (e.g. `12345678 ban` or `12345678 unban`)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_BAN_UNBAN
+
+    elif data == 'admin_direct_msg':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "💬 **SEND DIRECT PRIVATE MESSAGE TO USER**\n\nPlease enter target User ID and message text below:\nFormat: `USER_ID MESSAGE_TEXT` (e.g. `12345678 Hello your balance has been updated!`)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_DIRECT_MSG
+
+    elif data == 'admin_broadcast':
+        if not is_admin: return MENU
+        await query.edit_message_text(
+            "📢 **BROADCAST ANNOUNCEMENT TO ALL USERS**\n\nPlease enter your announcement text below. Markdown formatting supported!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='btn_admin_dashboard')]]),
+            parse_mode="Markdown"
+        )
+        return WAIT_BROADCAST
+
+    elif data == 'admin_review_receipts':
+        if not is_admin: return MENU
+        pending = fetch_pending_receipts()
+        if not pending:
+            await query.edit_message_text(
+                "✅ **No pending receipts to review!**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data='btn_admin_dashboard')]])
             )
             return MENU
-        
-        await update.message.reply_text(
-            "📋 **How many ID cards per A4 page?**\n\n"
-            "Select 2, 3, 4, or 5 cards to print on a single A4 page.",
-            parse_mode="Markdown",
-            reply_markup=batch_card_count_keyboard()
+        rec = pending[0]
+        r_msg = (
+            f"🧾 **PENDING RECEIPT REVIEW (1/{len(pending)})**\n\n"
+            f"🆔 **Receipt ID:** `{rec['id']}` | **User:** `{rec['user_id']}`\n"
+            f"💰 **Amount:** `{rec['amount']:.2f} ETB`\n"
+            f"📝 **Raw Text:**\n`{rec['raw_text']}`\n"
+            f"📌 **Note:** `{rec['manual_note'] or 'None'}`"
         )
-        return BATCH_MODE
-    elif text == "⚙️ Settings":
-        await settings_cmd(update, context)
-        return SETTINGS
-    elif text == "📞 Help":
-        await update.message.reply_text("📞 **Support Information**\n\nFor assistance, contact: @altleg\n\nResponse time: Usually within 24 hours", parse_mode="Markdown")
+        btns = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"appr_{rec['id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"rej_{rec['id']}")
+            ],
+            [InlineKeyboardButton("🔙 Admin Panel", callback_data='btn_admin_dashboard')]
+        ])
+        await query.edit_message_text(r_msg, reply_markup=btns, parse_mode="Markdown")
         return MENU
-    elif text == "💰 Balance":
-        if user_id == ADMIN_ID:
-            balance_msg = "✅ **Admin Account**\n\n💰 Unlimited Free Access\n\n🎉 No packages needed!"
-        else:
-            credits = get_credits(user_id)
-            balance_msg = f"💰 **Your Balance:** {credits} packages\n\n💳 Payment coming soon!"
-        
-        await update.message.reply_text(balance_msg, reply_markup=main_menu_reply_keyboard(), parse_mode="Markdown")
-        return MENU
-    elif text == "❌ Cancel":
-        await update.message.reply_text("Cancelled. Back to main menu.", reply_markup=main_menu_reply_keyboard())
-        return MENU
-    
+
+    elif data == 'btn_main_menu':
+        return await start(update, context)
+
     return MENU
 
-async def select_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pkg_map = {'pkg_1': '1', 'pkg_20': '20', 'pkg_100': '100', 'pkg_150': '150'}
-    context.user_data['pending_pkg'] = pkg_map[query.data]
-    pkg_amount = query.data.replace('pkg_', '')
-    
-    payment_msg = (
-        f"💳 **Payment Details**\n\n"
-        f"📱 Send **{pkg_map[query.data]} birr** to: `{TELEBIRR_NUMBER}`\n\n"
-        f"After sending, reply with the SMS receipt/transaction ID"
-    )
-    await query.edit_message_text(payment_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data='back_main')]]))
-    return WAIT_RECEIPT
 
-async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    
-    # Get the username or fallback to First Name if they don't have one
-    user_name = f"@{user.username}" if user.username else user.first_name
-    
-    # Add Username to the admin message
-    admin_msg = (
-        f"🔔 New Payment\n"
-        f"👤 User: {user_name}\n"
-        f"🆔 ID: {user.id}\n"
-        f"📦 Pkg: {context.user_data.get('pending_pkg')}\n\n"
-        f"📝 SMS Receipt:\n{update.message.text}"
-    )
-    
-    btns = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"appr_{user.id}_{context.user_data.get('pending_pkg')}"), 
-        InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}")
-    ]])
-    
-    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, reply_markup=btns, parse_mode="Markdown")
-    await update.message.reply_text("Receipt sent for approval. / ደረሰኝዎ ለቁጥጥር ተልኳል።")
-    return MENU
+# ==========================================
+# 7. 100% INLINE DRIVEN ADMIN ACTION HANDLERS
+# ==========================================
 
-async def admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data.split("_")
-    if data[0] == "appr":
-        add_credits(int(data[1]), int(data[2]))
-        await context.bot.send_message(chat_id=int(data[1]), text="✅ Payment Approved!")
-        await query.edit_message_text("✅ Approved")
-    elif data[0] == "rej":
-        await context.bot.send_message(chat_id=int(data[1]), text="❌ Payment Rejected")
-        await query.edit_message_text("❌ Rejected")
-    else:
-        await query.edit_message_text("Done.")
-
-async def handle_print_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Print Now button with multi-stage progress workflow"""
-    query = update.callback_query
-    await query.answer()  # Answer callback query to stop loading spinner
+async def handle_ban_unban_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    text = update.message.text.strip()
+    parts = text.split()
     
-    user_id = query.from_user.id
-    
-    # Prevent duplicate processing
-    if context.user_data.get('print_now_processing'):
-        await query.answer("⏳ Already processing. Please wait...", show_alert=True)
-        return
-    
-    # Mark as processing
-    context.user_data['print_now_processing'] = True
-    
-    # Check if we have a source PDF
-    source_pdf = context.user_data.get('last_pdf_path')
-    
-    if not source_pdf or not os.path.exists(source_pdf):
-        context.user_data['print_now_processing'] = False
-        await query.answer("❌ Source PDF not found. Please upload a PDF again.", show_alert=True)
-        return
-    
-    try:
-        # Stage 1: Processing PDF
-        progress_msg = await query.message.reply_text(
-            "🖨️ **Print Now**\n\n"
-            "1️⃣ Processing PDF...",
-            parse_mode="Markdown"
-        )
+    if len(parts) >= 1 and parts[0].isdigit():
+        target_uid = int(parts[0])
+        action = parts[1].lower() if len(parts) > 1 else 'ban'
         
-        # Extract data from PDF
-        data = await asyncio.to_thread(extract_data_from_pdf, source_pdf, f"{user_id}_print")
-        
-        if not data:
-            context.user_data['print_now_processing'] = False
-            await progress_msg.edit_text(
-                "❌ **Error**\n\nFailed to extract PDF data. Please try again.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_now')]])
-            )
-            return
-        
-        # Stage 2: Preparing ID cards
-        await progress_msg.edit_text(
-            "🖨️ **Print Now**\n\n"
-            "1️⃣ Processing PDF... ✅\n"
-            "2️⃣ Preparing ID cards...",
-            parse_mode="Markdown"
-        )
-        
-        # Generate printable ID
-        user_mode = context.user_data.get('output_mode', 'color')
-        template = context.user_data.get('template_choice')
-        printable_path = f"printable_{user_id}.png"
-        
-        await asyncio.to_thread(
-            generate_fayda_v3, 
-            data, 
-            printable_path, 
-            f"{user_id}_print", 
-            user_mode, 
-            template_path=template
-        )
-        
-        # Stage 3: Creating A4 printable layout
-        await progress_msg.edit_text(
-            "🖨️ **Print Now**\n\n"
-            "1️⃣ Processing PDF... ✅\n"
-            "2️⃣ Preparing ID cards... ✅\n"
-            "3️⃣ Creating A4 printable layout...",
-            parse_mode="Markdown"
-        )
-        
-        # For single PDF, create a simple printable (or could arrange on A4 if multiple)
-        if os.path.exists(printable_path):
-            # Stage 4: Finalizing
-            await progress_msg.edit_text(
-                "🖨️ **Print Now**\n\n"
-                "1️⃣ Processing PDF... ✅\n"
-                "2️⃣ Preparing ID cards... ✅\n"
-                "3️⃣ Creating A4 printable layout... ✅\n"
-                "4️⃣ Finalizing...",
+        if action in ['unban', 'free', 'allow', 'remove']:
+            set_user_ban(target_uid, banned=False)
+            await update.message.reply_text(
+                f"✅ **User {target_uid} restriction removed. Access restored!**",
+                reply_markup=admin_dashboard_inline_keyboard(),
                 parse_mode="Markdown"
             )
-            
-            # Send the printable file
-            with open(printable_path, 'rb') as f:
-                filename = f"Fayda_Printable_{user_id}.png"
-                await query.message.reply_document(
-                    f,
-                    filename=filename,
-                    caption="✅ **Your Printable ID is Ready!**\n\n🖨️ Ready to print!\n\n💡 Use high-quality print settings (photo quality) for best results."
-                )
-            
-            # Auto-completion message
-            await progress_msg.edit_text(
-                "🖨️ **Print Now**\n\n"
-                "1️⃣ Processing PDF... ✅\n"
-                "2️⃣ Preparing ID cards... ✅\n"
-                "3️⃣ Creating A4 printable layout... ✅\n"
-                "4️⃣ Finalizing... ✅\n\n"
-                "✅ **Printable file sent successfully!**",
-                parse_mode="Markdown",
-                reply_markup=print_now_keyboard()
-            )
         else:
-            context.user_data['print_now_processing'] = False
-            await progress_msg.edit_text(
-                "❌ **Error**\n\nFailed to generate printable file.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_now')]])
+            set_user_ban(target_uid, banned=True)
+            await update.message.reply_text(
+                f"🚫 **User {target_uid} has been banned / restricted.**",
+                reply_markup=admin_dashboard_inline_keyboard(),
+                parse_mode="Markdown"
             )
-            return
-    
-    except Exception as e:
-        context.user_data['print_now_processing'] = False
-        await progress_msg.edit_text(
-            f"❌ **Error**\n\n{str(e)[:100]}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_now')]])
-        )
-        return
-    
-    finally:
-        # Cleanup
-        for f in [f"printable_{user_id}.png", f"photo_{user_id}_print.png", 
-                 f"qr_{user_id}_print.png", f"fin_{user_id}_print.png"]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+        return MENU
         
-        context.user_data['print_now_processing'] = False
+    await update.message.reply_text("❌ Invalid input. Use format: `USER_ID ban` or `USER_ID unban` (e.g. `12345678 ban`)")
+    return MENU
 
-
-# 5. INTEGRATED PDF HANDLER WITH UPDATABLE STATUS
-
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_direct_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    
-    # Free access for admin
-    if user_id != ADMIN_ID:
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    text = update.message.text.strip()
+    parts = text.split(" ", 1)
+    if len(parts) == 2 and parts[0].isdigit():
+        target_uid = int(parts[0])
+        msg_content = parts[1]
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=f"💬 **MESSAGE FROM ADMIN**\n\n{msg_content}",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text(f"✅ Direct message sent successfully to User `{target_uid}`!", reply_markup=admin_dashboard_inline_keyboard(), parse_mode="Markdown")
+            return MENU
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to send message to User `{target_uid}`: {e}", reply_markup=admin_dashboard_inline_keyboard())
+            return MENU
+    await update.message.reply_text("❌ Invalid format. Use: `USER_ID MESSAGE_TEXT` (e.g. `12345678 Hello!`)")
+    return MENU
+
+async def handle_custom_price_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    text = update.message.text.strip()
+    parts = text.split()
+    if len(parts) == 2 and parts[0].isdigit():
+        target_uid = int(parts[0])
+        if parts[1].lower() == 'reset':
+            set_user_custom_price(target_uid, None)
+            await update.message.reply_text(f"✅ Reset User `{target_uid}` custom price to global default ({get_pdf_price():.2f} ETB)!", reply_markup=admin_dashboard_inline_keyboard(), parse_mode="Markdown")
+            return MENU
+        try:
+            c_price = float(parts[1])
+            set_user_custom_price(target_uid, c_price)
+            await update.message.reply_text(f"✅ Set User `{target_uid}` custom price to `{c_price:.2f} ETB`!", reply_markup=admin_dashboard_inline_keyboard(), parse_mode="Markdown")
+            return MENU
+        except ValueError:
+            pass
+    await update.message.reply_text("❌ Invalid format. Use: `USER_ID PRICE` (e.g. `12345678 30` or `12345678 reset`)")
+    return MENU
+
+async def handle_price_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    text = update.message.text.strip()
+    try:
+        new_price = float(text)
+        set_setting("pdf_to_id_price", str(new_price))
         await update.message.reply_text(
-            "🔒 **Service Coming Soon**\n\n"
-            "This service is currently in beta and available only to admin users.\n\n"
-            "📱 Telebirr and Bank integration coming soon! Stay tuned.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_reply_keyboard()
+            f"✅ **Global PDF Price updated successfully to {new_price:.2f} ETB!**",
+            reply_markup=admin_dashboard_inline_keyboard(),
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price format. Enter a valid number.")
+    return MENU
+
+async def handle_user_balance_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    text = update.message.text.strip()
+    parts = text.split()
+    if len(parts) == 2 and parts[0].isdigit():
+        target_uid = int(parts[0])
+        try:
+            amt = float(parts[1])
+            add_balance(target_uid, amt)
+            new_bal, _ = get_user_info(target_uid)
+            await update.message.reply_text(
+                f"✅ **Updated User {target_uid} Balance!**\n💰 Added: `{amt:.2f} ETB` | New Balance: `{new_bal:.2f} ETB`",
+                reply_markup=admin_dashboard_inline_keyboard(),
+                parse_mode="Markdown"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text=f"🔔 **Admin Balance Update:** Your wallet balance has been updated by `{amt:.2f} ETB`. New balance: `{new_bal:.2f} ETB`.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            return MENU
+        except ValueError:
+            pass
+    await update.message.reply_text("❌ Invalid input format. Use: `USER_ID AMOUNT` (e.g. `12345678 100`)")
+    return MENU
+
+async def handle_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ADMIN_ID > 0 and user_id != ADMIN_ID: return MENU
+    broadcast_text = update.message.text.strip()
+
+    all_users = get_all_user_ids()
+    status_msg = await update.message.reply_text(f"📢 **Starting broadcast to {len(all_users)} users...**")
+
+    success_cnt = 0
+    fail_cnt = 0
+
+    for uid in all_users:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📢 **ANNOUNCEMENT**\n\n{broadcast_text}",
+                parse_mode="Markdown"
+            )
+            success_cnt += 1
+        except Exception:
+            fail_cnt += 1
+        await asyncio.sleep(0.05)
+
+    await status_msg.edit_text(
+        f"📢 **BROADCAST COMPLETED!**\n\n"
+        f"✅ Delivered: `{success_cnt}` users\n"
+        f"❌ Blocked/Failed: `{fail_cnt}` users\n"
+        f"📊 Total Target: `{len(all_users)}` users",
+        reply_markup=admin_dashboard_inline_keyboard(),
+        parse_mode="Markdown"
+    )
+    return MENU
+
+
+# ==========================================
+# 8. LOCAL DIRECT CBE VERIFICATION HANDLER
+# ==========================================
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    if is_user_banned(user_id):
+        await update.message.reply_text(f"🚫 **Your account has been restricted by Admin.** Contact {SUPPORT_USERNAME} for support.", parse_mode="Markdown")
+        return MENU
+
+    text = update.message.text.strip()
+
+    # Route Bottom Persistent Reply Keyboard clicks
+    if text in ["📋 Control Panel", "📋 Main Menu", "/start", "/menu"]:
+        return await start(update, context)
+
+    elif text in ["📄 Direct Print"]:
+        balance, _ = get_user_info(user_id)
+        price = get_user_effective_price(user_id)
+        await update.message.reply_text(
+            f"📄 **Direct Single PDF Mode**\n\n"
+            f"Simply send your **Fayda ID PDF** file directly in chat!\n"
+            f"💰 Cost per ID: `{price:.2f} ETB` | Your Balance: `{balance:.2f} ETB`",
+            reply_markup=main_reply_keyboard(),
+            parse_mode="Markdown"
         )
         return MENU
-    
-    credits = get_credits(user_id)
 
-    # Create updatable status message
-    status_msg = await update.message.reply_text("⏳ **Processing...**\n\n📥 Downloading PDF...", parse_mode="Markdown")
-    
-    pdf_path = f"input_{user_id}.pdf"
-    file = await context.bot.get_file(update.message.document.file_id)
-    await file.download_to_drive(pdf_path)
-    
-    # Store PDF path for Print Now functionality
-    context.user_data['last_pdf_path'] = pdf_path
-    context.user_data['print_now_processing'] = False
+    elif text in ["📦 Bulk Mode"]:
+        context.user_data['batch_pdfs'] = []
+        await update.message.reply_text(
+            "📦 **INTERACTIVE BULK MODE (1 to 5 PDFs)**\n\n"
+            "Progress: `[░░░░░] 0/5 PDFs`\n\n"
+            "📥 Please send PDF 1/5 now.\n"
+            "💡 Tap **🖨️ Convert Now** at any time to print collected PDFs!",
+            reply_markup=bulk_interactive_keyboard(0),
+            parse_mode="Markdown"
+        )
+        return BATCH_MODE
+
+    elif text in ["💳 Deposit / Balance", "💳 Wallet"]:
+        balance, _ = get_user_info(user_id)
+        price = get_user_effective_price(user_id)
+        wallet_msg = (
+            f"💳 **YOUR WALLET ACCOUNT**\n\n"
+            f"👤 **User ID:** `{user_id}`\n"
+            f"💰 **Available Balance:** `{balance:.2f} ETB`\n"
+            f"🏷 **Your Rate:** `{price:.2f} ETB` / ID\n\n"
+            f"🏦 **CBE Account:** `{CBE_EXPECTED_ACCOUNT}` ({CBE_EXPECTED_HOLDER})\n"
+            f"📱 **Telebirr Number:** `{TELEBIRR_NUMBER}`\n"
+            f"Paste your CBE SMS receipt link (`mbreciept.cbe.com.et...`) directly in chat!"
+        )
+        await update.message.reply_text(wallet_msg, reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+        return MENU
+
+    elif text in ["📞 Support & Help", "📞 Support"]:
+        await update.message.reply_text(f"📞 **CUSTOMER SUPPORT**\n\nFor assistance or inquiries, contact: {SUPPORT_USERNAME}", reply_markup=main_reply_keyboard(), parse_mode="Markdown")
+        return MENU
+
+    # 100% Local CBE Direct Verification with Supabase Cross-Project Receipt Checking
+    if "mbreciept.cbe.com.et" in text.lower():
+        msg = await update.message.reply_text("🔎 **Verifying CBE Receipt directly with Official CBE Server & Shared DB...**")
+        v_res = await asyncio.to_thread(verify_cbe_local, text)
+
+        if not v_res["ok"]:
+            await msg.edit_text(v_res["error"], parse_mode="Markdown")
+            return MENU
+
+        short_code = v_res["short_code"]
+        cbe_link = v_res["cbe_link"]
+        txn_id = v_res["transaction_id"]
+        amount = v_res["amount"]
+
+        if receipt_already_used(text, cbe_link, txn_id):
+            await msg.edit_text("❌ **This CBE Receipt link or Transaction ID has already been used!**")
+            return MENU
+
+        rec_id = record_receipt(user_id, text, cbe_link, txn_id, amount, "VERIFIED")
+        if rec_id:
+            add_balance(user_id, amount)
+            new_bal, _ = get_user_info(user_id)
+            await msg.edit_text(
+                f"✅ **CBE Receipt Verified Successfully!**\n\n"
+                f"👤 Payer: `{v_res.get('payer_name', 'Unknown')}`\n"
+                f"🏦 Account: `{v_res.get('receiver_account', '')}`\n"
+                f"💰 Credited Amount: `{amount:.2f} ETB`\n"
+                f"💳 New Wallet Balance: `{new_bal:.2f} ETB`",
+                parse_mode="Markdown"
+            )
+            return MENU
+        else:
+            await msg.edit_text("❌ **Duplicate receipt transaction.**")
+            return MENU
+
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+    await update.message.reply_text(
+        "⚠️ **Invalid input.** Please send a valid **Fayda ID PDF file** or paste a **CBE SMS Receipt Link** (`mbreciept.cbe.com.et...`).",
+        reply_markup=main_menu_inline_keyboard(is_admin)
+    )
+    return MENU
+
+
+# ==========================================
+# 9. SINGLE & BULK PDF HANDLERS WITH CONCURRENCY LOCKS & FAST REMBG
+# ==========================================
+
+async def process_single_pdf_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    doc = update.message.document
+
+    if is_user_banned(user_id):
+        await update.message.reply_text(f"🚫 **Your account has been restricted by Admin.** Contact {SUPPORT_USERNAME} for support.", parse_mode="Markdown")
+        return MENU
+
+    if not doc or not doc.file_name.lower().endswith('.pdf'):
+        return
+
+    # Concurrency Lock Guard
+    with LOCK_SET_GUARD:
+        if user_id in ACTIVE_USER_LOCKS:
+            await update.message.reply_text("⏳ **Your previous file is currently being processed.** Please wait a moment...")
+            return MENU
+        ACTIVE_USER_LOCKS.add(user_id)
+
+    price_per_id = get_user_effective_price(user_id)
+    balance, _ = get_user_info(user_id)
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+
+    if balance < price_per_id:
+        with LOCK_SET_GUARD: ACTIVE_USER_LOCKS.discard(user_id)
+        await update.message.reply_text(
+            f"❌ **Insufficient Wallet Balance!**\n\n"
+            f"💰 Cost per ID: `{price_per_id:.2f} ETB` | Your Balance: `{balance:.2f} ETB`\n"
+            f"Please deposit funds to continue.",
+            reply_markup=main_menu_inline_keyboard(is_admin),
+            parse_mode="Markdown"
+        )
+        return MENU
+
+    msg = await update.message.reply_text("⏳ 📥 **Downloading Fayda PDF...**")
+    temp_prefix = f"single_{user_id}_{int(datetime.now().timestamp())}"
+    pdf_path = f"{temp_prefix}.pdf"
 
     try:
-        # Update: Extracting data
-        await status_msg.edit_text("⏳ **Processing...**\n\n🔍 Extracting data...", parse_mode="Markdown")
-        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, user_id)
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(pdf_path)
+
+        await msg.edit_text("⏳ 🔍 **Extracting Fayda ID Data & Photo (10x Fast Engine)...**")
+        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, temp_prefix)
         
         if data:
-            # Update: Generating card
-            await status_msg.edit_text("⏳ **Processing...**\n\n🎨 Generating ID card...", parse_mode="Markdown")
-            
-            user_template = context.user_data.get('template_choice')
+            await msg.edit_text("⏳ 🎨 **Rendering High-Precision ID Card...**")
             user_mode = context.user_data.get('output_mode', 'color')
-            out_path = f"{user_mode}_{user_id}.png"
+            is_flipped = (context.user_data.get('canvas_flip', 'normal') == 'flipped')
+            
+            out_path = f"Fayda_{temp_prefix}.png"
+            await asyncio.to_thread(generate_fayda_v3, data, out_path, temp_prefix, user_mode, None, is_flipped)
 
-            await asyncio.to_thread(generate_fayda_v3, data, out_path, user_id, user_mode, template_path=user_template)
-            
-            # Store file path for Print Now button
-            context.user_data['last_printable'] = out_path
-            
-            # Update: Uploading result
-            await status_msg.edit_text("⏳ **Processing...**\n\n📤 Uploading result...", parse_mode="Markdown")
-            
+            deduct_balance(user_id, price_per_id, converted_count=1)
+            new_bal, _ = get_user_info(user_id)
+
+            await msg.edit_text("⏳ 📤 **Delivering Printable Document...**")
             with open(out_path, 'rb') as f:
-                filename = "Fayda_Color.png" if user_mode == 'color' else "Fayda_BW.png"
-                await update.message.reply_document(f, filename=filename, caption="✅ Your ID Card is ready!")
-            
-            # Final success message with Print Now button
-            if user_id == ADMIN_ID:
-                final_text = (
-                    "✅ **Success! (Admin - Free Access)**\n\n"
-                    "📄 ID card generated successfully\n"
-                    "🎉 Unlimited free printing"
+                await update.message.reply_document(
+                    f,
+                    filename=f"Fayda_{data.get('name_eng', 'ID').replace(' ', '_')}.png",
+                    caption=(
+                        f"✅ **Fayda ID Conversion Successful!**\n\n"
+                        f"🎨 Mode: `{user_mode.upper()}` | 🔄 Canvas: `{'FLIPPED' if is_flipped else 'NORMAL'}`\n"
+                        f"💰 Deducted: `{price_per_id:.2f} ETB` | Balance: `{new_bal:.2f} ETB`"
+                    ),
+                    reply_markup=main_menu_inline_keyboard(is_admin),
+                    parse_mode="Markdown"
                 )
-            else:
-                add_credits(user_id, -1)
-                new_balance = get_credits(user_id)
-                final_text = (
-                    f"✅ **Success!**\n\n"
-                    f"💼 1 package used\n"
-                    f"💰 Remaining balance: **{new_balance}** packages"
-                )
-            
-            await status_msg.edit_text(
-                final_text,
-                parse_mode="Markdown",
-                reply_markup=print_now_keyboard()
-            )
+            if os.path.exists(out_path): os.remove(out_path)
+            # Auto-destroy progress message
+            await msg.delete()
         else:
-            await status_msg.edit_text(
-                "❌ **Extraction Failed**\n\n"
-                "The PDF format is not recognized. Please ensure you're using an official FAYDA PDF.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_id')]])
-            )
-    except Exception as e:
-        await status_msg.edit_text(
-            f"❌ **Error occurred**\n\nError: {str(e)[:100]}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_id')]])
-        )
+            await msg.edit_text("❌ **Extraction failed.** Invalid Fayda PDF layout or unreadable file.")
     finally:
-        for f in [pdf_path, f"{context.user_data.get('output_mode', 'color')}_{user_id}.png", f"photo_{user_id}.png", f"qr_{user_id}.png", f"fin_{user_id}.png"]:
-            if os.path.exists(f): os.remove(f)
+        with LOCK_SET_GUARD: ACTIVE_USER_LOCKS.discard(user_id)
+        if os.path.exists(pdf_path): os.remove(pdf_path)
+        for temp_f in [f"photo_{temp_prefix}.png", f"qr_{temp_prefix}.png", f"fin_{temp_prefix}.png"]:
+            if os.path.exists(temp_f): os.remove(temp_f)
+    return MENU
 
-async def handle_batch_count_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user selection of how many cards per A4 page"""
+
+async def handle_batch_pdf_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    
-    # Only admin can use batch mode
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Batch mode is admin-only.", reply_markup=main_menu_reply_keyboard())
+    doc = update.message.document
+
+    if is_user_banned(user_id):
+        await update.message.reply_text(f"🚫 **Your account has been restricted by Admin.** Contact {SUPPORT_USERNAME} for support.", parse_mode="Markdown")
         return MENU
-    
-    text = update.message.text
-    card_count_map = {
-        "2️⃣ 2 Cards per A4": 2,
-        "3️⃣ 3 Cards per A4": 3,
-        "4️⃣ 4 Cards per A4": 4,
-        "5️⃣ 5 Cards per A4": 5,
-    }
-    
-    if text not in card_count_map:
-        await update.message.reply_text("❌ Invalid selection. Please choose a valid option.", reply_markup=batch_card_count_keyboard())
+
+    if not doc or not doc.file_name.lower().endswith('.pdf'):
+        await update.message.reply_text("⚠️ Please send a valid **.pdf** document.", reply_markup=bulk_interactive_keyboard(len(context.user_data.get('batch_pdfs', []))))
         return BATCH_MODE
-    
-    num_cards = card_count_map[text]
-    
-    # Initialize batch list
-    context.user_data['batch_pdfs'] = []
-    context.user_data['batch_count'] = 0
-    context.user_data['batch_target'] = num_cards
-    
-    await update.message.reply_text(
-        f"📋 **Batch Mode: {num_cards} Cards per A4**\n\n📤 Send PDF {1}/{num_cards} now",
-        parse_mode="Markdown",
-        reply_markup=cancel_keyboard()
-    )
-    return BATCH_MODE
 
-async def handle_batch_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle multiple PDFs for batch processing"""
-    user_id = update.message.from_user.id
-    
-    # Only admin can use batch mode
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Batch mode is admin-only.", reply_markup=main_menu_reply_keyboard())
-        return MENU
-    
-    # Initialize if first PDF
-    target_count = context.user_data.get('batch_target', 5)
-    
-    if 'batch_pdfs' not in context.user_data:
-        context.user_data['batch_pdfs'] = []
-        context.user_data['batch_count'] = 0
-        context.user_data['batch_target'] = target_count
-    
-    # Download PDF
-    pdf_path = f"batch_{user_id}_{context.user_data['batch_count']}.pdf"
-    file = await context.bot.get_file(update.message.document.file_id)
+    context.user_data.setdefault('batch_pdfs', [])
+    batch_list = context.user_data['batch_pdfs']
+
+    temp_prefix = f"batch_{user_id}_{len(batch_list)+1}_{int(datetime.now().timestamp())}"
+    pdf_path = f"{temp_prefix}.pdf"
+    file = await context.bot.get_file(doc.file_id)
     await file.download_to_drive(pdf_path)
-    
-    context.user_data['batch_count'] += 1
-    context.user_data['batch_pdfs'].append(pdf_path)
-    
-    # Show progress
-    progress = context.user_data['batch_count']
-    target_count = context.user_data.get('batch_target', 5)
-    
-    if progress < target_count:
+
+    batch_list.append(pdf_path)
+    count = len(batch_list)
+
+    progress_bar = "█" * count + "░" * (MAX_BATCH_PDFS - count)
+
+    if count < MAX_BATCH_PDFS:
         await update.message.reply_text(
-            f"✅ PDF {progress}/{target_count} received!\n\n⏳ Waiting for PDF {progress + 1}/{target_count}...",
-            reply_markup=cancel_keyboard()
+            f"✅ **PDF {count}/{MAX_BATCH_PDFS} received!**\n\n"
+            f"Progress: `[{progress_bar}] {count}/{MAX_BATCH_PDFS}`\n\n"
+            f"📥 Send PDF {count+1}/{MAX_BATCH_PDFS} or tap **🖨️ Convert Now** below to print all {count} IDs on A4 sheet!",
+            reply_markup=bulk_interactive_keyboard(count),
+            parse_mode="Markdown"
         )
         return BATCH_MODE
     else:
-        # All PDFs received, process them
-        target_count = context.user_data.get('batch_target', 5)
-        status_msg = await update.message.reply_text(
-            f"✅ All {target_count} PDFs received!\n\n⏳ **Processing...**\n\n🔍 Extracting data from PDFs...",
-            parse_mode="Markdown"
-        )
-        
-        try:
-            card_paths = []
-            
-            # Process each PDF
-            for i, pdf_path in enumerate(context.user_data['batch_pdfs']):
-                await status_msg.edit_text(
-                    f"⏳ **Processing...**\n\n🔍 Extracting data from PDF {i+1}/{target_count}...",
-                    parse_mode="Markdown"
-                )
-                
-                data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, f"{user_id}_batch_{i}")
-                
-                if data:
-                    await status_msg.edit_text(
-                        f"⏳ **Processing...**\n\n🎨 Generating card {i+1}/{target_count}...",
-                        parse_mode="Markdown"
-                    )
-                    
-                    card_path = f"batch_card_{user_id}_{i}.png"
-                    user_mode = context.user_data.get('output_mode', 'color')
-                    await asyncio.to_thread(generate_fayda_v3, data, card_path, f"{user_id}_batch_{i}", user_mode)
-                    card_paths.append(card_path)
-            
-            if len(card_paths) == target_count:
-                await status_msg.edit_text(
-                    "⏳ **Processing...**\n\n📋 Arranging cards on A4 page...",
-                    parse_mode="Markdown"
-                )
-                
-                a4_output = f"batch_a4_{user_id}.png"
-                await asyncio.to_thread(arrange_cards_on_a4, card_paths, a4_output, target_count)
-                
-                await status_msg.edit_text(
-                    "⏳ **Processing...**\n\n📤 Uploading A4 page...",
-                    parse_mode="Markdown"
-                )
-                
-                # Send final A4 image
-                with open(a4_output, 'rb') as f:
-                    filename = f"Fayda_{target_count}Cards_A4.png"
-                    caption = f"✅ **{target_count} ID Cards on A4 Page Ready!**\n\n📋 Ready to print!\n\n🖨️ Use high-quality print settings for best results."
-                    await update.message.reply_document(f, filename=filename, caption=caption)
-                
-                # Store file path for Print Now button
-                context.user_data['last_printable'] = a4_output
-                
-                await status_msg.edit_text(
-                    f"✅ **Success!**\n\n"
-                    f"📋 {target_count} ID cards arranged on one A4 page\n"
-                    f"🖨️ Ready to print!\n\n"
-                    f"💡 Use high-quality print settings (photo quality) for best results.",
-                    parse_mode="Markdown",
-                    reply_markup=print_now_keyboard()
-                )
-            else:
-                await status_msg.edit_text(
-                    f"❌ **Error**\n\nOnly {len(card_paths)}/{target_count} cards were generated successfully.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_id')]])
-                )
-        
-        except Exception as e:
-            await status_msg.edit_text(
-                f"❌ **Error occurred**\n\nError: {str(e)[:100]}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data='print_id')]])
-            )
-        
-        finally:
-            # Cleanup
-            for pdf_path in context.user_data.get('batch_pdfs', []):
-                if os.path.exists(pdf_path):
-                    os.remove(pdf_path)
-            
-            for i in range(5):
-                for pattern in [f"batch_card_{user_id}_{i}.png", f"photo_{user_id}_batch_{i}.png", 
-                               f"qr_{user_id}_batch_{i}.png", f"fin_{user_id}_batch_{i}.png"]:
-                    if os.path.exists(pattern):
-                        os.remove(pattern)
-            
-            a4_file = f"batch_a4_{user_id}.png"
-            if os.path.exists(a4_file):
-                os.remove(a4_file)
-            
-            context.user_data['batch_pdfs'] = []
-            context.user_data['batch_count'] = 0
-        
+        await update.message.reply_text("✅ **5/5 PDFs received!** Starting automatic conversion onto A4 printable sheet...")
+        return await execute_batch_conversion(update, context)
+
+
+async def handle_bulk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+
+    if data == 'bulk_convert_now':
+        batch_list = context.user_data.get('batch_pdfs', [])
+        if not batch_list:
+            await query.message.reply_text("⚠️ No PDFs received yet. Please send at least 1 PDF.")
+            return BATCH_MODE
+        return await execute_batch_conversion(update, context)
+
+    elif data == 'bulk_cancel':
+        batch_list = context.user_data.get('batch_pdfs', [])
+        for p in batch_list:
+            if os.path.exists(p): os.remove(p)
+        context.user_data['batch_pdfs'] = []
+        await query.edit_message_text("❌ **Bulk conversion cancelled.**", reply_markup=main_menu_inline_keyboard(is_admin))
         return MENU
 
 
+async def execute_batch_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    batch_list = context.user_data.get('batch_pdfs', [])
+    pdf_count = len(batch_list)
+    is_admin = (ADMIN_ID > 0 and user_id == ADMIN_ID)
+
+    if pdf_count == 0:
+        return MENU
+
+    # Lock check for batch execution
+    with LOCK_SET_GUARD:
+        if user_id in ACTIVE_USER_LOCKS:
+            await context.bot.send_message(chat_id=user_id, text="⏳ **Your conversion task is already processing.** Please wait...")
+            return MENU
+        ACTIVE_USER_LOCKS.add(user_id)
+
+    price_per_id = get_user_effective_price(user_id)
+    total_cost = pdf_count * price_per_id
+    balance, _ = get_user_info(user_id)
+
+    if balance < total_cost:
+        with LOCK_SET_GUARD: ACTIVE_USER_LOCKS.discard(user_id)
+        msg = f"❌ **Insufficient Wallet Balance!**\n\n📦 PDFs to convert: **{pdf_count}**\n💰 Total Cost: `{total_cost:.2f} ETB` | Your Balance: `{balance:.2f} ETB`\nPlease deposit funds to continue."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(msg, reply_markup=main_menu_inline_keyboard(is_admin), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(msg, reply_markup=main_menu_inline_keyboard(is_admin), parse_mode="Markdown")
+        return MENU
+
+    status_msg = await context.bot.send_message(
+        chat_id=user_id,
+        text=f"⏳ **Processing {pdf_count} Fayda ID PDF(s) onto Printable A4 Sheet...**",
+        parse_mode="Markdown"
+    )
+
+    temp_prefix = f"exec_batch_{user_id}_{int(datetime.now().timestamp())}"
+    output_dir = f"output_{temp_prefix}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    card_png_files = []
+    success_count = 0
+
+    user_mode = context.user_data.get('output_mode', 'color')
+    is_flipped = (context.user_data.get('canvas_flip', 'normal') == 'flipped')
+
+    try:
+        for idx, p_path in enumerate(batch_list, 1):
+            sub_prefix = f"{temp_prefix}_{idx}"
+            data = await asyncio.to_thread(extract_data_from_pdf, p_path, sub_prefix)
+            if data:
+                safe_name = re.sub(r'[^\w\-_]', '_', data.get('name_eng', f"ID_{idx}"))
+                c_out = os.path.join(output_dir, f"{idx:02d}_{safe_name}.png")
+                await asyncio.to_thread(generate_fayda_v3, data, c_out, sub_prefix, user_mode, None, is_flipped)
+                card_png_files.append(c_out)
+                success_count += 1
+
+            for temp_f in [f"photo_{sub_prefix}.png", f"qr_{sub_prefix}.png", f"fin_{sub_prefix}.png"]:
+                if os.path.exists(temp_f): os.remove(temp_f)
+
+        if success_count == 0:
+            await status_msg.edit_text("❌ **Conversion failed.** Could not extract valid Fayda data from the PDF(s).")
+            return MENU
+
+        a4_output_path = f"Fayda_Printable_A4_{temp_prefix}.png"
+        await asyncio.to_thread(arrange_cards_on_a4, card_png_files, a4_output_path, success_count)
+
+        actual_cost = success_count * price_per_id
+        deduct_balance(user_id, actual_cost, converted_count=success_count)
+        new_bal, _ = get_user_info(user_id)
+
+        with open(a4_output_path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename=f"Fayda_Printable_A4_{success_count}_IDs.png",
+                caption=(
+                    f"🎉 **Printable A4 Sheet Ready ({success_count} Fayda ID Cards)!**\n\n"
+                    f"🎨 Mode: `{user_mode.upper()}` | 🔄 Canvas: `{'FLIPPED' if is_flipped else 'NORMAL'}`\n"
+                    f"💰 Total Deducted: `{actual_cost:.2f} ETB` | Balance: `{new_bal:.2f} ETB`\n\n"
+                    f"🖨 **Ready to Print!** Print on A4 paper at 100% scale and cut along guidelines."
+                ),
+                reply_markup=main_menu_inline_keyboard(is_admin),
+                parse_mode="Markdown"
+            )
+
+        if os.path.exists(a4_output_path): os.remove(a4_output_path)
+        # Auto-destroy progress message
+        await status_msg.delete()
+
+    finally:
+        with LOCK_SET_GUARD: ACTIVE_USER_LOCKS.discard(user_id)
+        for p in batch_list:
+            if os.path.exists(p): os.remove(p)
+        if os.path.exists(output_dir): shutil.rmtree(output_dir, ignore_errors=True)
+        context.user_data['batch_pdfs'] = []
+
+    return MENU
 
 
-# ADD THIS NEW BLOCK
-# 1. Initialize Database and Bot (OUTSIDE the main block)
-init_db()
+# ==========================================
+# 10. MAIN ENTRY POINT
+# ==========================================
 
-# Initialize the Telegram App globally so Flask can see it
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-# Define Handlers
-conv = ConversationHandler(
-    entry_points=[CommandHandler('start', start), MessageHandler(filters.Document.PDF, handle_pdf)],
-    states={
-        MENU: [
-            MessageHandler(filters.Document.PDF, handle_pdf),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons),
-            CallbackQueryHandler(button_tap, pattern="^(print_id|buy_package|contact_help|back_main)$")
+    init_db()
+    warm_up_rembg_session()
+
+    if not BOT_TOKEN:
+        print("⚠️ WARNING: BOT_TOKEN is empty! Please set BOT_TOKEN in your .env file.")
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        print(f"☁️ Supabase Cross-Project Receipt Sync active on table: '{SUPABASE_TABLE}'")
+    else:
+        print("ℹ️ Supabase not configured in .env (Using Local SQLite Database for receipt tracking).")
+
+    print("🚀 Initializing Fayda ID Bot (Supabase + Local SQLite Receipt Tracking)...")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            CommandHandler('admin', start),
+            CommandHandler('menu', start),
+            CallbackQueryHandler(handle_callback_query),
+            MessageHandler(filters.Document.PDF, process_single_pdf_direct),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
         ],
-        BUY_PACK: [
-            CallbackQueryHandler(select_package, pattern="^(pkg_1|pkg_20|pkg_100|pkg_150)$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons)
-        ],
-        WAIT_RECEIPT: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)
-        ],
-        SETTINGS: [
-            CallbackQueryHandler(settings_callback, pattern="^(set_template|set_mode|back_main|tpl:.*|mode:.*)$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons)
-        ],
-        BATCH_MODE: [
-            MessageHandler(filters.Document.PDF, handle_batch_pdf),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons)
-        ]
-    },
-    fallbacks=[CommandHandler('start', start)]
-)
+        states={
+            MENU: [
+                CallbackQueryHandler(handle_callback_query),
+                MessageHandler(filters.Document.PDF, process_single_pdf_direct),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+            ],
+            WAIT_RECEIPT: [
+                CallbackQueryHandler(handle_callback_query),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+            ],
+            SETTINGS: [
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            BATCH_MODE: [
+                MessageHandler(filters.Document.PDF, handle_batch_pdf_interactive),
+                CallbackQueryHandler(handle_bulk_callback)
+            ],
+            WAIT_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text),
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            WAIT_USER_BALANCE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_balance_adjust),
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            WAIT_PRICE_SETTING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_setting),
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            WAIT_DIRECT_MSG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_msg),
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            WAIT_CUSTOM_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_price_setting),
+                CallbackQueryHandler(handle_callback_query)
+            ],
+            WAIT_BAN_UNBAN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ban_unban_input),
+                CallbackQueryHandler(handle_callback_query)
+            ]
+        },
+        fallbacks=[CommandHandler('start', start)],
+        per_message=False
+    )
 
-app.add_handler(conv)
-app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
-app.add_handler(CallbackQueryHandler(handle_print_now, pattern="^print_now$"))
-app.add_handler(CommandHandler('settings', settings_cmd))
-app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_template|set_mode|back_main|back_settings|tpl:.*|mode:.*)$"))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(approve_receipt, pattern="^(appr|rej)_"))
 
-# 2. Add a helper to start the bot's background processes
-async def setup_webhook():
-    URL = os.environ.get("RENDER_EXTERNAL_URL")
-    if URL:
-        await app.bot.set_webhook(url=f"{URL}/webhook")
-        print(f"🚀 Webhook set to {URL}/webhook")
+    print("✅ Bot started successfully in 100% Polling mode! Listening for updates...")
+    app.run_polling()
 
-# This logic runs when Gunicorn starts
-import threading
-if os.environ.get("RENDER_EXTERNAL_URL"):
-    # Run the webhook setup in the background
-    import asyncio
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(app.initialize())).start()
-
-# 3. Keep the main block ONLY for local testing (VS Code)
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 10000))
-    URL = os.environ.get("RENDER_EXTERNAL_URL") 
-
-    if not URL:
-        print("🚀 Local Mode: Polling")
-        app.run_polling()
+    main()
