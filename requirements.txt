@@ -1,6 +1,6 @@
-python-telegram-bot
-pymupdf
-pillow
-ethiopian-date
-requests
-numpy
+aiogram>=3.4.0
+supabase>=2.3.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+pytelebirr
+beautifulsoup4

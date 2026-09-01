@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="am">
+<head>
+<meta charset="UTF-8">
+<title>ሜላክስ ዲጂታል ሾፕ - የተሟላ የሲስተም አሰራር መመሪያ</title>
+<style>
+    @page {
+        size: A4;
+        margin: 20mm 15mm 20mm 15mm;
+        @bottom-right {
+            content: counter(page);
+        }
+    }
+    body {
+        font-family: 'Nyala', 'Segoe UI', 'Noto Sans Ethiopic', Tahoma, Geneva, Verdana, sans-serif;
+        color: #1e293b;
+        background-color: #ffffff;
+        line-height: 1.6;
+        font-size: 14px;
+        margin: 0;
+        padding: 0;
+    }
+    .header-banner {
+        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 50%, #0284c7 100%);
+        color: #ffffff;
+        padding: 30px;
+        border-radius: 12px;
+        margin-bottom: 30px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    }
+    .header-banner h1 {
+        margin: 0 0 10px 0;
+        font-size: 26px;
+        color: #38bdf8;
+        font-weight: bold;
+    }
+    .header-banner p {
+        margin: 4px 0;
+        font-size: 14px;
+        color: #e2e8f0;
+    }
+    .badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-weight: bold;
+        text-transform: uppercase;
+        background-color: rgba(255,255,255,0.2);
+        color: #ffffff;
+        margin-right: 6px;
+    }
+    h2 {
+        color: #0f172a;
+        border-bottom: 2px solid #0284c7;
+        padding-bottom: 6px;
+        margin-top: 28px;
+        margin-bottom: 14px;
+        font-size: 18px;
+    }
+    h3 {
+        color: #1e3a8a;
+        margin-top: 18px;
+        margin-bottom: 8px;
+        font-size: 15px;
+    }
+    .card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-left: 4px solid #0284c7;
+        padding: 14px 18px;
+        border-radius: 6px;
+        margin-bottom: 15px;
+    }
+    .alert-box {
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-left: 4px solid #2563eb;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin: 12px 0;
+        font-size: 13px;
+    }
+    .warning-box {
+        background: #fffbeb;
+        border: 1px solid #fde68a;
+        border-left: 4px solid #d97706;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin: 12px 0;
+        font-size: 13px;
+    }
+    .success-box {
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-left: 4px solid #16a34a;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin: 12px 0;
+        font-size: 13px;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 15px 0;
+        font-size: 13px;
+    }
+    th {
+        background-color: #0f172a;
+        color: #ffffff;
+        text-align: left;
+        padding: 10px;
+        border: 1px solid #cbd5e1;
+    }
+    td {
+        padding: 8px 10px;
+        border: 1px solid #e2e8f0;
+    }
+    tr:nth-child(even) {
+        background-color: #f8fafc;
+    }
+    code {
+        background-color: #f1f5f9;
+        color: #0369a1;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: Consolas, Monaco, monospace;
+        font-size: 12px;
+    }
+    ul, ol {
+        margin: 8px 0;
+        padding-left: 22px;
+    }
+    li {
+        margin-bottom: 6px;
+    }
+    .footer {
+        margin-top: 40px;
+        padding-top: 15px;
+        border-top: 1px solid #cbd5e1;
+        text-align: center;
+        font-size: 11px;
+        color: #64748b;
+    }
+    .page-break {
+        page-break-before: always;
+    }
+</style>
+</head>
+<body>
+
+<div class="header-banner">
+    <span class="badge">ኦፊሴላዊ መመሪያ</span>
+    <span class="badge">Version 2.5</span>
+    <span class="badge">100% በአማርኛ</span>
+    <h1>💎 MELAX DIGITAL SHOP</h1>
+    <p><strong>የተሟላ የደንበኛ እና የአድሚን ዳሽቦርድ ዝርዝር አሰራር መመሪያ (Full Deep Guide)</strong></p>
+    <p>የቴሌግራም አውቶማቲክ ዲጂታል እቃዎች መሸጫ፣ ዋሌት እና የሪፈራል ኮሚሽን አስተዳደር ሲስተም</p>
+</div>
+
+<h2>📋 1. የሲስተሙ አጠቃላይ መግቢያ</h2>
+<div class="card">
+    <p><strong>ሜላክስ ዲጂታል ሾፕ (MELAX DIGITAL SHOP)</strong> ፕሪሚየም የዲጂታል አካውንቶችን (ChatGPT Plus, Spotify, Netflix, Canva, Gemini Advanced, ወዘተ) በ100% አውቶማቲክ አቅርቦት የሚያስተናግድ ዘመናዊ የቴሌግራም ቦት ነው። ሲስተሙ የንግድ ባንክ እና ቴሌብር ክፍያዎችን በ1 ሰከንድ ውስጥ አረጋግጦ ወደ ደንበኞች ዋሌት የመሙላት፣ 3 አይነት የአቅርቦት ስልቶችን የማስተናገድ፣ በእያንዳንዱ እቃ ላይ የሪፈራል ግዢ ኮሚሽን (Commission %) የመስጠት እና በአድሚኑ ሙሉ በሙሉ የመቆጣጠር አቅም አለው።</p>
+</div>
+
+<h2>👤 2. የደንበኞች ሙሉ መመሪያ (Customer User Guide)</h2>
+
+<h3>2.1. ቦቱን ማስጀመር እና ዋና ማውጫ (/start)</h3>
+<ul>
+    <li>ቦቱን ለመክፈት <code>/start</code> የሚለውን ይጫኑ ወይም ይጻፉ።</li>
+    <li>በነባሪነት በአማርኛ ቋንቋ ይከፈታል፤ ከታች በሚመጣው ኪቦርድ ወይም በዋናው ካርድ አማካኝነት ሁሉንም አገልግሎቶች በቀላሉ ያገኛሉ።</li>
+</ul>
+
+<h3>2.2. ዋሌት እና 100% አውቶማቲክ ሒሳብ መሙላት</h3>
+<div class="success-box">
+    <strong>⚡ ፈጣን ሒሳብ መሙያ አሰራር:</strong>
+    <ol>
+        <li>በዋናው ማውጫ ላይ <strong>[ 💳 ዋሌት ]</strong> የሚለውን ይጫኑ።</li>
+        <li>የተገለጸውን የባንክ ወይም የቴሌብር አካውንት በመጠቀም ክፍያ ይፈጽሙ፦
+            <ul>
+                <li><strong>የኢትዮጵያ ንግድ ባንክ (CBE):</strong> <code>1000320563279</code> (MELAX DIGITAL)</li>
+                <li><strong>ቴሌብር (Telebirr):</strong> <code>0984852932</code> (Melaku)</li>
+            </ul>
+        </li>
+        <li>ክፍያውን እንደፈጸሙ ከባንኩ የደረሶትን <strong>የCBE ደረሰኝ ሊንክ (mbreciept.cbe.com.et/...)</strong> ወይም <strong>የቴሌብር SMS ጽሑፍ</strong> ሙሉውን ኮፒ አድርገው ለቦቱ ይላኩ።</li>
+        <li>ቦቱ ክፍያውን በ1 ሰከንድ ውስጥ አረጋግጦ የዋሌት ሒሳብዎን ይሞላል!</li>
+    </ol>
+</div>
+<div class="warning-box">
+    <strong>⚠️ ጥንቃቄ:</strong> ቦቱ የደረሰኝ ፎቶ (Screenshot) አይቀበልም፤ የጽሑፍ ሊንክ ወይም የSMS መልዕክት ብቻ መላክ ያስፈልጋል።
+</div>
+
+<h3>2.3. ዲጂታል እቃዎችን መግዛት እና ማድረስ (Shopping & Instant Delivery)</h3>
+<ul>
+    <li><strong>[ 🛒 ዲጂታል እቃዎች ]</strong> ሲጫኑ የእቃዎች ዝርዝር ከነክምችታቸው (Stock) ጋር ይመጣል።</li>
+    <li>የሚፈልጉትን እቃ ይምረጡ፤ የቅናሽ ኮድ ካለዎት <strong>[ 🎟️ የቅናሽ ኮድ አስገባ ]</strong> የሚለውን ተጭነው ያስገቡ።</li>
+    <li><strong>[ 🛍️ አሁን ግዛ ]</strong> ➡️ <strong>[ ✅ ግዢውን አረጋግጥ ]</strong> ሲጫኑ ከዋሌትዎ ተቀንሶ እቃው ወዲያውኑ ይላክልዎታል።</li>
+    <li><strong>ባለ 3-አይነት አቅርቦት:</strong>
+        <ul>
+            <li><strong>AUTOMATIC:</strong> ኮዱ ወይም አካውንቱ በሰከንዶች ውስጥ በቦቱ ይላካል።</li>
+            <li><strong>MANUAL:</strong> አድሚኑ አካውንቱን አዘጋጅቶ በ10 ደቂቃ ውስጥ በቦቱ ይልክልዎታል።</li>
+            <li><strong>HYBRID:</strong> አውቶማቲክ ካለ ወዲያው ይላካል፤ ካለቀ ወደ አድሚን ማንዋል ይዞራል።</li>
+        </ul>
+    </li>
+    <li>የተገዙትን እቃዎች ዝርዝርና የይለፍ ቃል በማንኛውም ጊዜ <strong>[ 📦 ትዕዛዞቼ ]</strong> ውስጥ ማየት ይቻላል።</li>
+</ul>
+
+<h3>2.4. የሪፈራል እና የግብዣ ሽልማቶች (Dual Referral Program)</h3>
+<div class="success-box">
+    <strong>🎁 ድርብ የሪፈራል ሽልማት (Dual Rewards):</strong>
+    <ol>
+        <li><strong>ነጻ አካውንቶች በግብዣ ብዛት:</strong>
+            <ul>
+                <li><strong>20 ሰው ሲጋብዙ:</strong> 1 ነጻ Spotify Premium</li>
+                <li><strong>25 ሰው ሲጋብዙ:</strong> 1 ነጻ Google Gemini Advanced</li>
+            </ul>
+        </li>
+        <li><strong>የእድሜ ልክ የግዢ ኮሚሽን (Lifetime Purchase Commission):</strong>
+            <ul>
+                <li>በእርስዎ ሊንክ የተመዘገቡ ተጋባዦች ማንኛውንም እቃ በገዙ ቁጥር ለእቃው የተመደበው <strong>የኮሚሽን % (ከ5% እስከ 15%)</strong> በቀጥታ ወደ ዋሌትዎ ገቢ ይደረጋል!</li>
+                <li>ኮሚሽኑ ሲገባ በቴሌግራም ወዲያውኑ የደስታ ማስታወቂያ ይደርስዎታል።</li>
+            </ul>
+        </li>
+    </ol>
+</div>
+
+<h3>2.5. ፕሮፋይል እና የቋንቋ ምርጫ (Profile & Language Switcher)</h3>
+<ul>
+    <li><strong>[ 👤 ፕሮፋይሌ ]</strong> ውስጥ የዋሌት ሒሳብ፣ የትዕዛዝ ብዛት እና የVIP ደረጃ ይመልከቱ።</li>
+    <li><strong>[ 🌐 ቋንቋ ቀይር / Switch Language ]</strong> የሚለውን በመጫን ቦቱን በማንኛውም ጊዜ ከአማርኛ ወደ እንግሊዝኛ ወይም ከእንግሊዝኛ ወደ አማርኛ መቀየር ይችላሉ።</li>
+</ul>
+
+<div class="page-break"></div>
+
+<h2>⚙️ 3. የአድሚን ሙሉ መቆጣጠሪያ መመሪያ (Admin Master Guide)</h2>
+
+<h3>3.1. ወደ አድሚን ዳሽቦርድ መግባት</h3>
+<p>በቦቱ ላይ <code>/admin</code> ብለው ይጻፉ ወይም ከታች ባለው ኪቦርድ <strong>[ ⚙️ የአድሚን ዳሽቦርድ ]</strong> የሚለውን ይጫኑ።</p>
+
+<h3>3.2. የ7ቱ ማስተር ሰርቪሶች መቆጣጠሪያ (Master Switchboard)</h3>
+<table>
+    <thead>
+        <tr>
+            <th>ሰርቪስ</th>
+            <th>ተግባር</th>
+            <th>ሲጠፋ (OFF) የሚፈጠረው ሁኔታ</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>🛒 Shop System</strong></td>
+            <td>የዲጂታል እቃዎች ግብይት</td>
+            <td>ደንበኞች እቃዎችን ማየትና መግዛት አይችሉም።</td>
+        </tr>
+        <tr>
+            <td><strong>💳 Deposits</strong></td>
+            <td>የዋሌት ሒሳብ መሙያ</td>
+            <td>ሒሳብ መሙላት ለጊዜው ይቆማል።</td>
+        </tr>
+        <tr>
+            <td><strong>🎁 Referrals</strong></td>
+            <td>የግብዣ ሽልማቶች እና ኮሚሽን</td>
+            <td>የሽልማት መጠየቅና የኮሚሽን ስሌት ለጊዜው ይቆማል።</td>
+        </tr>
+        <tr>
+            <td><strong>🎟️ Discounts</strong></td>
+            <td>የቅናሽ እና ፕሮሞ ኮዶች</td>
+            <td>ደንበኞች የቅናሽ ኮድ መጠቀም አይችሉም።</td>
+        </tr>
+        <tr>
+            <td><strong>❓ Support Desk</strong></td>
+            <td>የደንበኞች እርዳታ ዴስክ</td>
+            <td>የድጋፍ መስጫ ገጹ ለጊዜው ዝግ ይሆናል።</td>
+        </tr>
+        <tr>
+            <td><strong>📢 Force Join</strong></td>
+            <td>የቻናል ግዴታ መቀላቀል</td>
+            <td>ደንበኞች ቻናል ሳይቀላቀሉ ቦቱን መጠቀም ይችላሉ።</td>
+        </tr>
+        <tr>
+            <td><strong>🛠️ Maintenance Mode</strong></td>
+            <td>አጠቃላይ የጥገና ሁነታ</td>
+            <td><strong>መላው ቦት ይዘጋል</strong>፤ ለአድሚኖች ብቻ ክፍት ይሆናል።</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3>3.3. የእቃዎች እና የኮሚሽን አስተዳደር (Products & Commission Management)</h3>
+<ul>
+    <li><strong>አዲስ እቃ ለመጨመር:</strong> <strong>[ ➕ አዲስ እቃ ጨምር ]</strong> ➡️ አብነት ይምረጡ (ChatGPT, Spotify, Netflix, ወዘተ) ➡️ ዋጋ፣ ክምችት፣ ማብራሪያ፣ የአቅርቦት አይነት (Auto/Manual/Hybrid) እና <strong>የሪፈራል ግዢ ኮሚሽን % (ለምሳሌ 10%)</strong> ያስገቡ።</li>
+    <li><strong>የኮሚሽን % ፈጣን ማስተካከያ (Quick Edit Commission):</strong> በካታሎግ ውስጥ እቃውን ከፍተው <strong>[ 🎁 Edit Commission % ]</strong> በመጫን ለእያንዳንዱ እቃ የኮሚሽን መቶኛን በማንኛውም ጊዜ መቀየር ይችላሉ።</li>
+</ul>
+
+<h3>3.4. የሪፈራል ሽልማቶች ማስተካከያ (Referral Reward Customization)</h3>
+<ul>
+    <li>የነበሩትን ሽልማቶች ማስተካከል (የሽልማቱን ስም እና የሚያስፈልገውን ሰው ብዛት መቀየር)።</li>
+    <li>አዲስ የሽልማት እርከን መጨመር (Add Tier) ወይም የማያስፈልገውን መደለዝ (Delete Tier)።</li>
+    <li><strong>የደንበኞችን ሽልማት ማጽደቅ:</strong> ደንበኞች ነጻ አካውንት ሲጠይቁ ለአድሚኑ ማሳወቂያ ይመጣል፤ አድሚኑ አካውንቱን በመላክ ያጸድቃል።</li>
+</ul>
+
+<h3>3.5. የቅናሽ ኮዶች እና የፍላሽ ሽያጭ (Discounts & Promo Codes)</h3>
+<ul>
+    <li>አዲስ የቅናሽ ኮድ መፍጠር (የመቶኛ % ወይም የብር ቅናሽ፣ የአጠቃቀም ገደብ እና ዝቅተኛ የግዢ መጠን መወሰን)።</li>
+    <li>መላው ሱቅ ላይ አጠቃላይ የፍላሽ ሽያጭ (Store-wide Flash Sale %) ማብራት/ማስተካከል።</li>
+</ul>
+
+<h3>3.6. የማንዋል ትዕዛዞች አቅርቦት (Manual Order Fulfillment)</h3>
+<ul>
+    <li>ደንበኛ የማንዋል እቃ ሲገዛ ወደ አድሚን ዳሽቦርድ <strong>[ ⏳ የሚጠበቁ ማንዋል ትዕዛዞች ]</strong> ይገባል።</li>
+    <li>አድሚኑ <strong>[ 🔑 Fulfill Order ]</strong> በመጫን የዲጂታል አካውንቱን ዝርዝር ሲጽፍ ቦቱ ለደንበኛው ያደርሳል፤ ጋባዥ ካለውም ኮሚሽኑን በራስ-ሰር አስልቶ ይልካል!</li>
+</ul>
+
+<h3>3.7. የደንበኞች ቁጥጥር (Customer CRM)</h3>
+<ul>
+    <li>ደንበኛን በቴሌግራም ID ወይም በUsername መፈለግ።</li>
+    <li>የዋሌት ሒሳብ መጨመር (<code>Add Balance</code>) ወይም መቀነስ (<code>Deduct Balance</code>)።</li>
+    <li>VIP ደረጃ መስጠት ወይም አላስፈላጊ ተጠቃሚዎችን ማገድ (<code>Ban</code>/<code>Unban</code>)።</li>
+    <li>ለሁሉም ተጠቃሚዎች በአንድ ጊዜ የጽሑፍ፣ የፎቶ ወይም የቪዲዮ ማስታወቂያ መላክ (<code>Broadcast</code>)።</li>
+</ul>
+
+<div class="footer">
+    <p>MELAX DIGITAL SHOP • 100% Automated Telegram Digital Store System • © 2026 Melaku Solutions</p>
+</div>
+
+</body>
+</html>

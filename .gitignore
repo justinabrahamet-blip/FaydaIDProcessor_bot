@@ -1,10 +1,16 @@
+# Environment variables and secrets
+.env
+
+# SQLite database files
+*.db
+*.sqlite3
+
+# Python cache & logs
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-users.db
-serial_counter.txt
-.env
-.DS_Store
 *.log
-nohup.out
+
+# IDE & OS settings
+.vscode/
+.idea/
+.DS_Store

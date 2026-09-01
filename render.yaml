@@ -1,6 +1,21 @@
 services:
   - type: worker
-    name: fayda-id-bot
+    name: melax-digital-shop-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main_bot.py
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AIVERSE_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: TELEBIRR_NO
+        sync: false
+      - key: CBE_NO
+        sync: false
+      - key: MARKUP_PERCENT
+        sync: false
+      - key: REFERRAL_PERCENT
+        sync: false
