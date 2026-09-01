@@ -77,6 +77,49 @@ async def safe_send(send_coro):
         return None
 
 
+# ==========================================
+# SAFE-TELEGRAM-SEND PATCH: auto-fallback to plain text on HTML entity parse errors
+# ==========================================
+from telegram.error import BadRequest as _BadRequest
+from telegram.ext import ExtBot as _ExtBot
+
+
+def _strip_html_for_fallback(text):
+    """Best-effort plain-text fallback: drop tags, unescape entities so it's still readable."""
+    if not text:
+        return text
+    plain = re.sub(r'<[^>]*>', '', text)
+    return html.unescape(plain)
+
+
+def _wrap_bot_method_with_html_fallback(method_name, text_kwarg):
+    original = getattr(_ExtBot, method_name)
+
+    async def patched(self, *args, **kwargs):
+        try:
+            return await original(self, *args, **kwargs)
+        except _BadRequest as e:
+            if "can't parse entities" in str(e).lower() and kwargs.get("parse_mode"):
+                print(f"[html_fallback] {method_name} entity parse error, retrying as plain text: {e}")
+                kwargs[text_kwarg] = _strip_html_for_fallback(kwargs.get(text_kwarg))
+                kwargs["parse_mode"] = None
+                try:
+                    return await original(self, *args, **kwargs)
+                except Exception as e2:
+                    print(f"[html_fallback] plain-text retry also failed for {method_name}: {e2}")
+                    return None
+            print(f"[{method_name}] BadRequest: {e}")
+            return None
+
+    setattr(_ExtBot, method_name, patched)
+
+
+_wrap_bot_method_with_html_fallback("send_message", "text")
+_wrap_bot_method_with_html_fallback("edit_message_text", "text")
+_wrap_bot_method_with_html_fallback("send_document", "caption")
+_wrap_bot_method_with_html_fallback("send_photo", "caption")
+
+
 _APP_MARKERS = {}
 Application._Application__stop_running_marker = property(
     lambda self: _APP_MARKERS.get((id(self), 'stop')),
@@ -1772,6 +1815,83 @@ async def execute_batch_conversion(update: Update, context: ContextTypes.DEFAULT
     return MENU
 
 
+async def handle_approve_reject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the ✅ Approve / ❌ Reject buttons on a pending receipt review card.
+
+    This was previously wired directly to the synchronous `approve_receipt(receipt_id, db_file=...)`
+    DB helper as the CallbackQueryHandler callback, which expects (update, context) and is a
+    coroutine. Every tap raised an exception before doing anything, so no balance was ever
+    credited, no user was notified, and the admin card never updated.
+    """
+    query = update.callback_query
+    await query.answer()
+    admin_user_id = query.from_user.id
+    is_admin = (ADMIN_ID > 0 and admin_user_id == ADMIN_ID)
+    if not is_admin:
+        return MENU
+
+    data = query.data
+    try:
+        action, receipt_id_str = data.split("_", 1)
+        receipt_id = int(receipt_id_str)
+    except (ValueError, IndexError):
+        await safe_send(query.edit_message_text("⚠️ Invalid receipt action.", parse_mode="HTML"))
+        return MENU
+
+    if action == "appr":
+        result = approve_receipt(receipt_id)
+        if not result:
+            await safe_send(query.answer("⚠️ Already processed or not found.", show_alert=True))
+        else:
+            user_id, amount = result
+            new_bal, _ = get_user_info(user_id)
+            await safe_send(query.edit_message_text(
+                f"✅ <b>Receipt #{receipt_id} APPROVED</b>\n💰 <code>{amount:.2f} ETB</code> credited to user <code>{user_id}</code>.",
+                parse_mode="HTML"
+            ))
+            await safe_send(context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 <b>Payment Verified!</b>\n\n💰 <code>{amount:.2f} ETB</code> has been added to your wallet.\n💳 New Balance: <code>{new_bal:.2f} ETB</code>",
+                parse_mode="HTML"
+            ))
+    elif action == "rej":
+        rejected_user = reject_receipt(receipt_id)
+        if not rejected_user:
+            await safe_send(query.answer("⚠️ Already processed or not found.", show_alert=True))
+        else:
+            await safe_send(query.edit_message_text(
+                f"❌ <b>Receipt #{receipt_id} REJECTED.</b>",
+                parse_mode="HTML"
+            ))
+            await safe_send(context.bot.send_message(
+                chat_id=rejected_user,
+                text=f"❌ <b>Your receipt (#{receipt_id}) was rejected.</b>\nPlease contact {h(SUPPORT_USERNAME)} if you believe this is a mistake.",
+                parse_mode="HTML"
+            ))
+
+    # Advance to the next pending receipt, if any
+    pending = fetch_pending_receipts()
+    if pending:
+        rec = pending[0]
+        r_msg = (
+            f"🧾 <b>PENDING RECEIPT REVIEW (1/{len(pending)})</b>\n\n"
+            f"🆔 <b>Receipt ID:</b> <code>{rec['id']}</code> | <b>User:</b> <code>{rec['user_id']}</code>\n"
+            f"💰 <b>Amount:</b> <code>{rec['amount']:.2f} ETB</code>\n"
+            f"📝 <b>Raw Text:</b>\n<code>{h(str(rec['raw_text']))}</code>\n"
+            f"📌 <b>Note:</b> <code>{h(str(rec['manual_note'] or 'None'))}</code>"
+        )
+        btns = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"appr_{rec['id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"rej_{rec['id']}")
+            ],
+            [InlineKeyboardButton("🔙 Admin Panel", callback_data='btn_admin_dashboard')]
+        ])
+        await safe_send(context.bot.send_message(chat_id=admin_user_id, text=r_msg, reply_markup=btns, parse_mode="HTML"))
+
+    return MENU
+
+
 # ==========================================
 # 10. MAIN ENTRY POINT
 # ==========================================
@@ -1856,8 +1976,21 @@ def main():
         per_message=False
     )
 
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        print(f"[global_error_handler] Unhandled exception: {context.error}")
+        try:
+            if ADMIN_ID > 0:
+                await safe_send(context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ Bot error: <code>{h(str(context.error))[:500]}</code>",
+                    parse_mode="HTML"
+                ))
+        except Exception:
+            pass
+
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(approve_receipt, pattern="^(appr|rej)_"))
+    app.add_handler(CallbackQueryHandler(handle_approve_reject_callback, pattern="^(appr|rej)_"))
+    app.add_error_handler(global_error_handler)
 
     print("✅ Bot started successfully in 100% Polling mode! Listening for updates...")
     app.run_polling(drop_pending_updates=True)
